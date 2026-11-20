@@ -9,6 +9,7 @@ struct DaykitTests {
     private func makeApp(
         store: MockEventStore = MockEventStore(),
         policy: RuntimePolicy = RuntimePolicy(),
+        auditWriter: AuditLogWriter = NoopAuditLogWriter(),
         nowISO: String = "2026-11-20T10:30:00-03:00",
         isTTY: Bool = false
     ) -> DaykitApp {
@@ -19,6 +20,7 @@ struct DaykitTests {
         return DaykitApp(
             store: store,
             policy: policy,
+            auditWriter: auditWriter,
             now: now,
             calendar: cal,
             timeZone: timeZone,
@@ -56,7 +58,7 @@ struct DaykitTests {
         #expect(dryRun == true)
     }
 
-    @Test("Rejects conflicting flags (--end + --duration, --json + --plain, invalid --days)")
+    @Test("Rejects conflicting flags (--end + --duration, --json + --plain, invalid --days, empty updates)")
     func cliParserRejectsConflicts() {
         #expect(throws: DaykitError.self) {
             try CLIParser.parse(["cal", "add", "--title", "X", "--start", "today", "--end", "tomorrow", "--duration", "1h"])
@@ -70,12 +72,24 @@ struct DaykitTests {
         #expect(throws: DaykitError.self) {
             try CLIParser.parse(["rem", "list", "--completed", "--all"])
         }
+        #expect(throws: DaykitError.self) {
+            try CLIParser.parse(["rem", "update", "--id", "r1", "--due", "today", "--clear-due"])
+        }
+        #expect(throws: DaykitError.self) {
+            try CLIParser.parse(["rem", "update", "--id", "r1"])
+        }
+        #expect(throws: DaykitError.self) {
+            try CLIParser.parse(["cal", "update", "--id", "e1", "--all-day", "--no-all-day"])
+        }
+        #expect(throws: DaykitError.self) {
+            try CLIParser.parse(["cal", "update", "--id", "e1", "--span", "all"])
+        }
     }
 
-    // MARK: - Date & URL Parsing
+    // MARK: - Date, Relative Time, URL & Instance ID Parsing
 
-    @Test("Distinguishes date-only YYYY-MM-DD and relative days from timed specs")
-    func dateParsingAndDuration() throws {
+    @Test("Distinguishes date-only YYYY-MM-DD and parses relative dates with wall-clock time")
+    func dateParsingAndRelativeTimes() throws {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = timeZone
         let now = ISO8601DateFormatter().date(from: "2026-11-20T10:30:00-03:00")!
@@ -86,9 +100,20 @@ struct DaykitTests {
         let plusThree = try DateParsing.parseTemporal("+3d", now: now, calendar: cal, timeZone: timeZone)
         #expect(plusThree == .dateOnly(year: 2026, month: 11, day: 23))
 
-        let timed = try DateParsing.parseTemporal("2026-11-20T14:30", now: now, calendar: cal, timeZone: timeZone)
-        #expect(!timed.isDateOnly)
+        let tomorrowMorning = try DateParsing.parseTemporal("tomorrow 09:00", now: now, calendar: cal, timeZone: timeZone)
+        #expect(!tomorrowMorning.isDateOnly)
+        #expect(tomorrowMorning.formatString(timeZone: timeZone) == "2026-11-21T09:00:00-03:00")
 
+        let todayEvening = try DateParsing.parseTemporal("todayT18:30", now: now, calendar: cal, timeZone: timeZone)
+        #expect(!todayEvening.isDateOnly)
+        #expect(todayEvening.formatString(timeZone: timeZone) == "2026-11-20T18:30:00-03:00")
+
+        let plusTwo = try DateParsing.parseTemporal("+2d 14:15:30", now: now, calendar: cal, timeZone: timeZone)
+        #expect(plusTwo.formatString(timeZone: timeZone) == "2026-11-22T14:15:30-03:00")
+
+        #expect(throws: DaykitError.self) {
+            try DateParsing.parseTemporal("tomorrow 25:00", now: now, calendar: cal, timeZone: timeZone)
+        }
         #expect(try DateParsing.parseDuration("1h30m") == 5400)
         #expect(throws: DaykitError.self) {
             try DateParsing.parseDuration("0m")
@@ -96,6 +121,17 @@ struct DaykitTests {
         #expect(throws: DaykitError.self) {
             try DateParsing.parseTemporal("2026-02-30", now: now, calendar: cal, timeZone: timeZone)
         }
+    }
+
+    @Test("Parses composite recurring EventInstanceRef while preserving UIDs containing @")
+    func eventInstanceRefParsing() {
+        let caldavBare = EventInstanceRef.parse("abc123@google.com")
+        #expect(caldavBare.seriesId == "abc123@google.com")
+        #expect(caldavBare.occurrenceDate == nil)
+
+        let caldavInstance = EventInstanceRef.parse("abc123@google.com@2026-11-21T13:00:00Z")
+        #expect(caldavInstance.seriesId == "abc123@google.com")
+        #expect(caldavInstance.occurrenceDate != nil)
     }
 
     @Test("Allows strictly https:// URLs without embedded credentials")
@@ -108,7 +144,7 @@ struct DaykitTests {
         }
     }
 
-    // MARK: - Reminder Overdue vs Today Semantics
+    // MARK: - Reminder Overdue, Update & Delete
 
     @Test("Date-only reminder due today is classified as today, not overdue")
     func reminderOverdueVsTodaySemantics() async throws {
@@ -137,6 +173,149 @@ struct DaykitTests {
         let todayItems = todayJSON["data"] as! [[String: Any]]
         let todayIDs = Set(todayItems.compactMap { $0["id"] as? String })
         #expect(todayIDs == Set(["r-date-today", "r-timed-later"]))
+    }
+
+    @Test("rem update enforces allowlists, supports partial/clear flags, --dry-run, and audit log")
+    func reminderUpdateBehavior() async throws {
+        let store = MockEventStore()
+        let audit = MockAuditLogWriter()
+        store.reminderLists = [
+            ReminderListSummary(id: "list-inbox", title: "Inbox", sourceName: "iCloud", sourceType: "icloud", colorHex: nil, writable: true, isDefault: true),
+            ReminderListSummary(id: "list-work", title: "Work", sourceName: "iCloud", sourceType: "icloud", colorHex: nil, writable: true, isDefault: false)
+        ]
+        store.reminders = [
+            ReminderRecord(id: "rem-1", title: "Water heater", listId: "list-inbox", listTitle: "Inbox", dueAt: nil, hasDueTime: false, completed: false, completionDate: nil, priority: .none, notes: "Call admin", hasNotes: true, notesTruncated: false, url: "https://example.com", isRecurring: false, createdAt: nil, modifiedAt: nil)
+        ]
+
+        let policy = RuntimePolicy(readOnly: false, writableCalendars: [], writableLists: ["Inbox"], auditLogEnabled: true)
+        let app = makeApp(store: store, policy: policy, auditWriter: audit)
+
+        // Move to disallowed destination list fails policy
+        let moveDenied = await app.run(arguments: ["rem", "update", "--id", "rem-1", "--list", "Work"])
+        #expect(moveDenied.exitCode == .permissionOrPolicyDenied)
+        #expect(store.updatedReminderInputs.isEmpty)
+
+        // Dry-run makes 0 mutations and 0 audit records
+        let dryOut = await app.run(arguments: ["rem", "update", "--id", "rem-1", "--due", "tomorrow 09:00", "--priority", "high", "--clear-notes", "--dry-run"])
+        #expect(dryOut.exitCode == .success)
+        #expect(store.updatedReminderInputs.isEmpty)
+        #expect(audit.entries.isEmpty)
+        let dryJSON = try decodeJSON(dryOut.stdout)
+        let afterPreview = (dryJSON["data"] as! [String: Any])["after"] as! [String: Any]
+        #expect(afterPreview["due_at"] as? String == "2026-11-21T09:00:00-03:00")
+        #expect(afterPreview["has_due_time"] as? Bool == true)
+        #expect(afterPreview["notes"] == nil)
+
+        // Live update records audit log and mutates reminder
+        let liveOut = await app.run(arguments: ["rem", "update", "--id", "rem-1", "--due", "tomorrow 09:00", "--priority", "high", "--clear-notes"])
+        #expect(liveOut.exitCode == .success)
+        #expect(store.updatedReminderInputs.count == 1)
+        #expect(audit.entries.count == 1)
+        #expect(audit.entries.first?.action == "update_reminder")
+        #expect(audit.entries.first?.beforeReminder?.notes == "Call admin")
+
+        // Clear due date
+        let clearDueOut = await app.run(arguments: ["rem", "update", "--id", "rem-1", "--clear-due"])
+        #expect(clearDueOut.exitCode == .success)
+        let clearedJSON = try decodeJSON(clearDueOut.stdout)
+        let clearedAfter = (clearedJSON["data"] as! [String: Any])["after"] as! [String: Any]
+        #expect(clearedAfter["due_at"] == nil)
+        #expect(clearedAfter["has_due_time"] as? Bool == false)
+    }
+
+    @Test("rem delete requires --yes for live execution, allows --dry-run, respects READ_ONLY, and logs audit")
+    func reminderDeleteGuardrails() async throws {
+        let store = MockEventStore()
+        let audit = MockAuditLogWriter()
+        store.reminderLists = [
+            ReminderListSummary(id: "list-inbox", title: "Inbox", sourceName: "iCloud", sourceType: "icloud", colorHex: nil, writable: true, isDefault: true)
+        ]
+        store.reminders = [
+            ReminderRecord(id: "rem-del", title: "Old task", listId: "list-inbox", listTitle: "Inbox", dueAt: nil, hasDueTime: false, completed: false, completionDate: nil, priority: .none, notes: nil, hasNotes: false, notesTruncated: false, url: nil, isRecurring: false, createdAt: nil, modifiedAt: nil)
+        ]
+
+        let app = makeApp(store: store, policy: RuntimePolicy(auditLogEnabled: true), auditWriter: audit)
+
+        // Live delete without --yes fails
+        let noYes = await app.run(arguments: ["rem", "delete", "--id", "rem-del"])
+        #expect(noYes.exitCode == .usageError)
+        #expect(store.deletedReminderIDs.isEmpty)
+        #expect(audit.entries.isEmpty)
+
+        // Dry-run works without --yes
+        let dryDel = await app.run(arguments: ["rem", "delete", "--id", "rem-del", "--dry-run"])
+        #expect(dryDel.exitCode == .success)
+        #expect(store.deletedReminderIDs.isEmpty)
+
+        // Read-only blocks even with --yes
+        let roApp = makeApp(store: store, policy: RuntimePolicy(readOnly: true), auditWriter: audit)
+        let roDel = await roApp.run(arguments: ["rem", "delete", "--id", "rem-del", "--yes"])
+        #expect(roDel.exitCode == .permissionOrPolicyDenied)
+        #expect(store.deletedReminderIDs.isEmpty)
+
+        // Live delete with --yes succeeds and records audit
+        let liveDel = await app.run(arguments: ["rem", "delete", "--id", "rem-del", "--yes"])
+        #expect(liveDel.exitCode == .success)
+        #expect(store.deletedReminderIDs == ["rem-del"])
+        #expect(audit.entries.count == 1)
+        #expect(audit.entries.first?.action == "delete_reminder")
+        #expect(audit.entries.first?.beforeReminder?.id == "rem-del")
+    }
+
+    // MARK: - Calendar Update & Delete Safety
+
+    @Test("cal update and delete enforce recurrence --span, --yes confirmation, all-day transitions, and audit log")
+    func calendarUpdateAndDeleteGuardrails() async throws {
+        let store = MockEventStore()
+        let audit = MockAuditLogWriter()
+        store.calendars = [
+            CalendarSummary(id: "cal-1", title: "Gabriel", sourceName: "iCloud", sourceType: "icloud", colorHex: nil, writable: true, isDefault: true, isSubscribed: false, isImmutable: false)
+        ]
+        store.events = [
+            EventRecord(instanceId: "ser-1@2026-11-21T13:00:00Z", seriesId: "ser-1", title: "Weekly Sync", startAt: "2026-11-21T10:00:00-03:00", endAt: "2026-11-21T11:00:00-03:00", allDay: false, timezone: "America/Santiago", calendarId: "cal-1", calendarTitle: "Gabriel", location: "Office", notes: nil, hasNotes: false, notesTruncated: false, url: nil, availability: "busy", status: "confirmed", isRecurring: true, isDetached: false, occurrenceDate: "2026-11-21T13:00:00Z", alarmsMinutesBefore: [15], attendees: []),
+            EventRecord(instanceId: "evt-allday", seriesId: "evt-allday", title: "Holiday", startAt: "2026-11-25", endAt: "2026-11-25", allDay: true, timezone: nil, calendarId: "cal-1", calendarTitle: "Gabriel", location: nil, notes: nil, hasNotes: false, notesTruncated: false, url: nil, availability: "free", status: "confirmed", isRecurring: false, isDetached: false, occurrenceDate: nil, alarmsMinutesBefore: [], attendees: [])
+        ]
+
+        let app = makeApp(store: store, policy: RuntimePolicy(auditLogEnabled: true), auditWriter: audit)
+
+        // Bare series_id rejects ambiguous recurring ID
+        let bareRecurring = await app.run(arguments: ["cal", "update", "--id", "ser-1", "--title", "Moved", "--span", "this"])
+        #expect(bareRecurring.exitCode == .usageError)
+
+        // Missing --span on recurring event fails
+        let missingSpan = await app.run(arguments: ["cal", "update", "--id", "ser-1@2026-11-21T13:00:00Z", "--title", "Moved"])
+        #expect(missingSpan.exitCode == .usageError)
+
+        // --span future without --yes fails
+        let futureNoYes = await app.run(arguments: ["cal", "update", "--id", "ser-1@2026-11-21T13:00:00Z", "--title", "Moved", "--span", "future"])
+        #expect(futureNoYes.exitCode == .usageError)
+
+        // Converting all-day to timed without timed --start fails
+        let noTimedStart = await app.run(arguments: ["cal", "update", "--id", "evt-allday", "--no-all-day", "--start", "2026-11-25"])
+        #expect(noTimedStart.exitCode == .usageError)
+
+        // Live recurring update with --span this + relative time works and logs audit
+        let liveUpdate = await app.run(arguments: ["cal", "update", "--id", "ser-1@2026-11-21T13:00:00Z", "--start", "tomorrow 11:30", "--clear-location", "--span", "this"])
+        #expect(liveUpdate.exitCode == .success)
+        #expect(store.updatedEventInputs.count == 1)
+        #expect(audit.entries.count == 1)
+        #expect(audit.entries.first?.span == "this")
+
+        // Delete recurring event requires --span and --yes
+        let delMissingSpan = await app.run(arguments: ["cal", "delete", "--id", "ser-1@2026-11-21T13:00:00Z", "--yes"])
+        #expect(delMissingSpan.exitCode == .usageError)
+
+        let delNoYes = await app.run(arguments: ["cal", "delete", "--id", "ser-1@2026-11-21T13:00:00Z", "--span", "this"])
+        #expect(delNoYes.exitCode == .usageError)
+
+        let delDry = await app.run(arguments: ["cal", "delete", "--id", "ser-1@2026-11-21T13:00:00Z", "--span", "this", "--dry-run"])
+        #expect(delDry.exitCode == .success)
+        #expect(store.deletedEventCalls.isEmpty)
+
+        let delLive = await app.run(arguments: ["cal", "delete", "--id", "ser-1@2026-11-21T13:00:00Z", "--span", "this", "--yes"])
+        #expect(delLive.exitCode == .success)
+        #expect(store.deletedEventCalls.count == 1)
+        #expect(audit.entries.count == 2)
     }
 
     // MARK: - Multi-Account Disambiguation & Guardrails
@@ -196,6 +375,32 @@ struct DaykitTests {
         #expect(store.createdEventInputs.isEmpty)
         #expect(store.createdReminderInputs.isEmpty)
         #expect(store.completedReminderIDs.isEmpty)
+    }
+
+    // MARK: - Audit Logger POSIX Permissions
+
+    @Test("FileAuditLogWriter creates 0600 file and appends single-line JSONL records")
+    func fileAuditLogWriterPermissionsAndJSONL() throws {
+        let baseDir = FileManager.default.temporaryDirectory.appendingPathComponent("daykit-audit-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let logFile = baseDir.appendingPathComponent("daykit/audit.jsonl")
+
+        let writer = FileAuditLogWriter(path: logFile.path)
+        let entry1 = AuditEntry(timestamp: "2026-11-20T20:00:00-03:00", action: "delete_reminder", targetId: "r-1")
+        let entry2 = AuditEntry(timestamp: "2026-11-20T20:01:00-03:00", action: "update_event", targetId: "e-1", span: "this")
+        try writer.record(entry1)
+        try writer.record(entry2)
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: logFile.path)
+        let perms = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        #expect((perms & 0o777) == 0o600)
+
+        let contents = try String(contentsOf: logFile, encoding: .utf8)
+        let lines = contents.split(separator: "\n")
+        #expect(lines.count == 2)
+        let decoded = try JSONSerialization.jsonObject(with: Data(lines[1].utf8)) as! [String: Any]
+        #expect(decoded["action"] as? String == "update_event")
+        #expect(decoded["span"] as? String == "this")
     }
 
     // MARK: - Briefing, Prompt Injection Mitigation, Doctor

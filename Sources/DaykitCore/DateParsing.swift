@@ -77,6 +77,23 @@ public enum DateParsing {
             return .dateOnly(year: year, month: month, day: day)
         }
 
+        if let (relativeDays, timeString) = splitRelativeDayAndTime(trimmed) {
+            guard let (hour, minute, second) = parseStrictWallClockTime(timeString) else {
+                throw DaykitError(
+                    code: "INVALID_DATE",
+                    exitCode: .usageError,
+                    message: "Invalid time '\(timeString)' in '\(raw)'. Expected HH:MM or HH:MM:SS (24h)."
+                )
+            }
+            let todayStart = calendar.startOfDay(for: now)
+            guard let shiftedDay = calendar.date(byAdding: .day, value: relativeDays, to: todayStart),
+                  let resolved = calendar.date(bySettingHour: hour, minute: minute, second: second, of: shiftedDay)
+            else {
+                throw DaykitError(code: "INVALID_DATE", exitCode: .usageError, message: "Cannot resolve date/time '\(trimmed)'.")
+            }
+            return .dateTime(resolved)
+        }
+
         if let ymd = parseExactDateOnly(trimmed, calendar: calendar) {
             return .dateOnly(year: ymd.year, month: ymd.month, day: ymd.day)
         }
@@ -85,7 +102,7 @@ public enum DateParsing {
             return .dateTime(localDate)
         }
 
-        if let isoDate = parseRFC3339(trimmed) {
+        if let isoDate = parseISO8601Timestamp(trimmed) {
             return .dateTime(isoDate)
         }
 
@@ -93,7 +110,7 @@ public enum DateParsing {
             code: "INVALID_DATE",
             exitCode: .usageError,
             message: "Invalid date/time format: '\(raw)'.",
-            hint: "Use YYYY-MM-DD, YYYY-MM-DDTHH:MM, RFC3339 (e.g. 2026-11-20T14:30:00-03:00), or today/tomorrow/+Nd."
+            hint: "Use YYYY-MM-DD, YYYY-MM-DDTHH:MM, RFC3339, today/tomorrow/+Nd, or 'tomorrow 09:00'."
         )
     }
 
@@ -222,6 +239,17 @@ public enum DateParsing {
         return ("", false)
     }
 
+    public static func parseISO8601Timestamp(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) {
+            return date
+        }
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+        return standard.date(from: value)
+    }
+
     private static func parseRelativeDayKeyword(_ lower: String) -> Int? {
         switch lower {
         case "today": return 0
@@ -234,6 +262,43 @@ public enum DateParsing {
             let numSlice = lower.dropLast()
             return Int(numSlice)
         }
+    }
+
+    private static func splitRelativeDayAndTime(_ raw: String) -> (Int, String)? {
+        let spaceParts = raw.split(whereSeparator: { $0.isWhitespace })
+        if spaceParts.count == 2,
+           let days = parseRelativeDayKeyword(spaceParts[0].lowercased())
+        {
+            return (days, String(spaceParts[1]))
+        }
+        let lower = raw.lowercased()
+        for sepIdx in lower.indices where lower[sepIdx] == "t" && sepIdx > lower.startIndex {
+            let prefix = String(lower[..<sepIdx])
+            let suffix = String(raw[raw.index(after: sepIdx)...])
+            if !suffix.isEmpty, suffix.first?.isNumber == true, let days = parseRelativeDayKeyword(prefix) {
+                return (days, suffix)
+            }
+        }
+        return nil
+    }
+
+    private static func parseStrictWallClockTime(_ raw: String) -> (Int, Int, Int)? {
+        let parts = raw.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 2 || parts.count == 3 else { return nil }
+        guard parts[0].count == 2, parts[1].count == 2,
+              parts.allSatisfy({ $0.allSatisfy(\.isNumber) }),
+              let hour = Int(parts[0]), (0...23).contains(hour),
+              let minute = Int(parts[1]), (0...59).contains(minute)
+        else { return nil }
+
+        let second: Int
+        if parts.count == 3 {
+            guard parts[2].count == 2, let sec = Int(parts[2]), (0...59).contains(sec) else { return nil }
+            second = sec
+        } else {
+            second = 0
+        }
+        return (hour, minute, second)
     }
 
     private static func parseExactDateOnly(_ value: String, calendar: Calendar) -> (year: Int, month: Int, day: Int)? {
@@ -275,16 +340,5 @@ public enum DateParsing {
             }
         }
         return nil
-    }
-
-    private static func parseRFC3339(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) {
-            return date
-        }
-        let standard = ISO8601DateFormatter()
-        standard.formatOptions = [.withInternetDateTime]
-        return standard.date(from: value)
     }
 }

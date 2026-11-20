@@ -3,6 +3,7 @@ import Foundation
 public struct DaykitApp: Sendable {
     private let store: EventStoreProtocol
     private let policy: RuntimePolicy
+    private let auditWriter: AuditLogWriter
     private let now: Date
     private let calendar: Calendar
     private let timeZone: TimeZone
@@ -13,6 +14,7 @@ public struct DaykitApp: Sendable {
     public init(
         store: EventStoreProtocol,
         policy: RuntimePolicy,
+        auditWriter: AuditLogWriter = NoopAuditLogWriter(),
         now: Date = Date(),
         calendar: Calendar = .current,
         timeZone: TimeZone = .current,
@@ -22,6 +24,7 @@ public struct DaykitApp: Sendable {
     ) {
         self.store = store
         self.policy = policy
+        self.auditWriter = auditWriter
         self.now = now
         var configuredCalendar = calendar
         configuredCalendar.timeZone = timeZone
@@ -113,6 +116,35 @@ public struct DaykitApp: Sendable {
                     : "Created\(result.dryRun ? " (dry-run)" : ""): \(title)\n"
                 return ExecutionOutput(exitCode: .success, stdout: out, stderr: "")
 
+            case .calUpdate(let id, let title, let startRaw, let endRaw, let durationRaw, let allDay, let calendarRef, let locationPatch, let notesPatch, let urlPatch, let alarmsPatch, let span, let dryRun, let yes):
+                let result = try await runCalUpdate(
+                    id: id,
+                    title: title,
+                    startRaw: startRaw,
+                    endRaw: endRaw,
+                    durationRaw: durationRaw,
+                    allDay: allDay,
+                    calendarRef: calendarRef,
+                    locationPatch: locationPatch,
+                    notesPatch: notesPatch,
+                    urlPatch: urlPatch,
+                    alarmsPatch: alarmsPatch,
+                    span: span,
+                    dryRun: dryRun,
+                    yes: yes
+                )
+                let out = useJSON
+                    ? try OutputFormatting.encodeSuccess(command: "cal update", data: result, now: now, timeZone: timeZone)
+                    : OutputFormatting.renderPlainUpdateEvent(result)
+                return ExecutionOutput(exitCode: .success, stdout: out, stderr: "")
+
+            case .calDelete(let id, let span, let dryRun, let yes):
+                let result = try await runCalDelete(id: id, span: span, dryRun: dryRun, yes: yes)
+                let out = useJSON
+                    ? try OutputFormatting.encodeSuccess(command: "cal delete", data: result, now: now, timeZone: timeZone)
+                    : OutputFormatting.renderPlainDeleteEvent(result)
+                return ExecutionOutput(exitCode: .success, stdout: out, stderr: "")
+
             case .remLists:
                 try await ensureReadableAccess(for: .reminders)
                 let lists = try await store.listReminderLists()
@@ -168,11 +200,34 @@ public struct DaykitApp: Sendable {
                     : "Created reminder\(result.dryRun ? " (dry-run)" : ""): \(title)\n"
                 return ExecutionOutput(exitCode: .success, stdout: out, stderr: "")
 
+            case .remUpdate(let id, let title, let listRef, let duePatch, let priority, let notesPatch, let urlPatch, let dryRun):
+                let result = try await runRemUpdate(
+                    id: id,
+                    title: title,
+                    listRef: listRef,
+                    duePatch: duePatch,
+                    priority: priority,
+                    notesPatch: notesPatch,
+                    urlPatch: urlPatch,
+                    dryRun: dryRun
+                )
+                let out = useJSON
+                    ? try OutputFormatting.encodeSuccess(command: "rem update", data: result, now: now, timeZone: timeZone)
+                    : OutputFormatting.renderPlainUpdateReminder(result)
+                return ExecutionOutput(exitCode: .success, stdout: out, stderr: "")
+
             case .remDone(let id, let dryRun):
                 let result = try await runRemDone(id: id, dryRun: dryRun)
                 let out = useJSON
                     ? try OutputFormatting.encodeSuccess(command: "rem done", data: result, now: now, timeZone: timeZone)
                     : "Completed reminder\(result.dryRun ? " (dry-run)" : ""): \(result.title) (id=\(result.completedId))\n"
+                return ExecutionOutput(exitCode: .success, stdout: out, stderr: "")
+
+            case .remDelete(let id, let dryRun, let yes):
+                let result = try await runRemDelete(id: id, dryRun: dryRun, yes: yes)
+                let out = useJSON
+                    ? try OutputFormatting.encodeSuccess(command: "rem delete", data: result, now: now, timeZone: timeZone)
+                    : OutputFormatting.renderPlainDeleteReminder(result)
                 return ExecutionOutput(exitCode: .success, stdout: out, stderr: "")
 
             case .briefing(let days, let maxOverdue, let calendarRefs, let listRefs, let includeNotes, let maxNotesBytes):
@@ -205,7 +260,7 @@ public struct DaykitApp: Sendable {
         switch mode {
         case .json: return true
         case .plain: return false
-        case .auto: return true // JSON-first contract by default; --plain opts into human text.
+        case .auto: return true
         }
     }
 
@@ -327,6 +382,20 @@ public struct DaykitApp: Sendable {
         }
     }
 
+    private func recordAudit(action: String, targetId: String, span: EventSpan? = nil, event: EventRecord? = nil, reminder: ReminderRecord? = nil) throws -> Bool {
+        guard policy.auditLogEnabled else { return false }
+        let entry = AuditEntry(
+            timestamp: DateParsing.formatRFC3339(now, timeZone: timeZone),
+            action: action,
+            targetId: targetId,
+            span: span?.rawValue,
+            beforeEvent: event,
+            beforeReminder: reminder
+        )
+        try auditWriter.record(entry)
+        return true
+    }
+
     private func resolveCalendarIDsForRead(_ refs: [String]) async throws -> [String]? {
         guard !refs.isEmpty else { return nil }
         let calendars = try await store.listCalendars()
@@ -366,21 +435,25 @@ public struct DaykitApp: Sendable {
             chosen = def
         }
 
+        try ensureCalendarWritable(chosen)
+        return chosen
+    }
+
+    private func ensureCalendarWritable(_ cal: CalendarSummary) throws {
         try ensureAllowedByPolicy(
-            targetId: chosen.id,
-            title: chosen.title,
-            sourceName: chosen.sourceName,
+            targetId: cal.id,
+            title: cal.title,
+            sourceName: cal.sourceName,
             allowlist: policy.writableCalendars,
             domainLabel: "calendar"
         )
-        guard chosen.writable else {
+        guard cal.writable else {
             throw DaykitError(
                 code: "CALENDAR_READ_ONLY",
                 exitCode: .permissionOrPolicyDenied,
-                message: "Calendar '\(chosen.sourceName)/\(chosen.title)' does not allow modifications."
+                message: "Calendar '\(cal.sourceName)/\(cal.title)' does not allow modifications."
             )
         }
-        return chosen
     }
 
     private func matchCalendars(ref: String, in calendars: [CalendarSummary]) -> [CalendarSummary] {
@@ -433,21 +506,25 @@ public struct DaykitApp: Sendable {
             chosen = def
         }
 
+        try ensureListWritable(chosen)
+        return chosen
+    }
+
+    private func ensureListWritable(_ list: ReminderListSummary) throws {
         try ensureAllowedByPolicy(
-            targetId: chosen.id,
-            title: chosen.title,
-            sourceName: chosen.sourceName,
+            targetId: list.id,
+            title: list.title,
+            sourceName: list.sourceName,
             allowlist: policy.writableLists,
             domainLabel: "reminder list"
         )
-        guard chosen.writable else {
+        guard list.writable else {
             throw DaykitError(
                 code: "LIST_READ_ONLY",
                 exitCode: .permissionOrPolicyDenied,
-                message: "Reminder list '\(chosen.sourceName)/\(chosen.title)' does not allow modifications."
+                message: "Reminder list '\(list.sourceName)/\(list.title)' does not allow modifications."
             )
         }
-        return chosen
     }
 
     private func matchLists(ref: String, in lists: [ReminderListSummary]) -> [ReminderListSummary] {
@@ -563,6 +640,364 @@ public struct DaykitApp: Sendable {
         return CreateEventResult(dryRun: false, action: "create_event", preview: nil, event: created)
     }
 
+    private func runCalUpdate(
+        id: String,
+        title: String?,
+        startRaw: String?,
+        endRaw: String?,
+        durationRaw: String?,
+        allDay: Bool?,
+        calendarRef: String?,
+        locationPatch: FieldPatch<String>,
+        notesPatch: FieldPatch<String>,
+        urlPatch: FieldPatch<String>,
+        alarmsPatch: FieldPatch<[String]>,
+        span: EventSpan?,
+        dryRun: Bool,
+        yes: Bool
+    ) async throws -> UpdateEventResult {
+        try ensureNotReadOnly()
+        try await ensureReadableAccess(for: .calendars)
+
+        guard let existing = try await store.findEvent(instanceId: id) else {
+            throw DaykitError(code: "EVENT_NOT_FOUND", exitCode: .notFound, message: "Event '\(id)' not found.")
+        }
+
+        let calendars = try await store.listCalendars()
+        guard let sourceCal = calendars.first(where: { $0.id == existing.calendarId }) else {
+            throw DaykitError(code: "CALENDAR_NOT_FOUND", exitCode: .notFound, message: "Parent calendar for event '\(id)' not found.")
+        }
+        try ensureCalendarWritable(sourceCal)
+
+        let destinationCal: CalendarSummary
+        if let calendarRef {
+            destinationCal = try await resolveSingleWritableCalendar(calendarRef)
+        } else {
+            destinationCal = sourceCal
+        }
+
+        if (existing.isRecurring || existing.isDetached) && span == nil {
+            throw DaykitError(
+                code: "SPAN_REQUIRED",
+                exitCode: .usageError,
+                message: "Event '\(existing.instanceId)' is recurring/detached; specify --span this or --span future."
+            )
+        }
+        let effectiveSpan = span ?? .this
+        if !dryRun && effectiveSpan == .future && !yes {
+            throw DaykitError(
+                code: "CONFIRMATION_REQUIRED",
+                exitCode: .usageError,
+                message: "Updating future occurrences (--span future) affects multiple events; pass --yes to confirm or preview with --dry-run."
+            )
+        }
+
+        let targetAllDay = allDay ?? existing.allDay
+        let (newStartDate, newEndDate) = try resolveUpdatedEventTimes(
+            existing: existing,
+            startRaw: startRaw,
+            endRaw: endRaw,
+            durationRaw: durationRaw,
+            targetAllDay: targetAllDay
+        )
+
+        let validatedURLPatch: FieldPatch<String>
+        switch urlPatch {
+        case .unchanged: validatedURLPatch = .unchanged
+        case .clear: validatedURLPatch = .clear
+        case .set(let raw): validatedURLPatch = .set(try DateParsing.validateHTTPSURL(raw))
+        }
+
+        let convertedAlarmsPatch: FieldPatch<[Int]>
+        switch alarmsPatch {
+        case .unchanged: convertedAlarmsPatch = .unchanged
+        case .clear: convertedAlarmsPatch = .clear
+        case .set(let raws):
+            let mins = try raws.map { raw -> Int in
+                let secs = try DateParsing.parseDuration(raw)
+                return Int(secs / 60)
+            }
+            convertedAlarmsPatch = .set(mins)
+        }
+
+        if dryRun {
+            let previewAfter = applyEventPreview(
+                existing: existing,
+                title: title,
+                startDate: newStartDate,
+                endDate: newEndDate,
+                targetAllDay: targetAllDay,
+                destinationCal: destinationCal,
+                locationPatch: locationPatch,
+                notesPatch: notesPatch,
+                urlPatch: validatedURLPatch,
+                alarmsPatch: convertedAlarmsPatch
+            )
+            return UpdateEventResult(dryRun: true, action: "update_event", span: effectiveSpan, before: existing, after: previewAfter, auditLogged: false)
+        }
+
+        let auditLogged = try recordAudit(action: "update_event", targetId: existing.instanceId, span: effectiveSpan, event: existing)
+
+        let updateStart: Date? = (startRaw != nil || allDay != nil) ? newStartDate : nil
+        let updateEnd: Date? = (startRaw != nil || endRaw != nil || durationRaw != nil || allDay != nil) ? newEndDate : nil
+
+        let input = EventUpdateInput(
+            instanceId: existing.instanceId,
+            span: effectiveSpan,
+            title: title,
+            startDate: updateStart,
+            endDate: updateEnd,
+            allDay: allDay,
+            calendarId: calendarRef != nil ? destinationCal.id : nil,
+            location: locationPatch,
+            notes: notesPatch,
+            url: validatedURLPatch,
+            alarmsMinutesBefore: convertedAlarmsPatch
+        )
+        let updated = try await store.updateEvent(input)
+        return UpdateEventResult(dryRun: false, action: "update_event", span: effectiveSpan, before: existing, after: updated, auditLogged: auditLogged)
+    }
+
+    private func resolveUpdatedEventTimes(
+        existing: EventRecord,
+        startRaw: String?,
+        endRaw: String?,
+        durationRaw: String?,
+        targetAllDay: Bool
+    ) throws -> (Date, Date) {
+        let oldStartTemp = try DateParsing.parseTemporal(existing.startAt, now: now, calendar: calendar, timeZone: timeZone)
+        let oldEndTemp = try DateParsing.parseTemporal(existing.endAt, now: now, calendar: calendar, timeZone: timeZone)
+        let oldStartDate = try oldStartTemp.startOfDayDate(calendar: calendar)
+        let oldEndDate = try oldEndTemp.startOfDayDate(calendar: calendar)
+
+        if existing.allDay && !targetAllDay {
+            guard let startRaw else {
+                throw DaykitError(
+                    code: "TIMED_START_REQUIRED",
+                    exitCode: .usageError,
+                    message: "Converting an all-day event to timed requires --start with an explicit time (e.g. 'tomorrow 09:00')."
+                )
+            }
+            let parsedStart = try DateParsing.parseTemporal(startRaw, now: now, calendar: calendar, timeZone: timeZone)
+            guard !parsedStart.isDateOnly else {
+                throw DaykitError(
+                    code: "TIMED_START_REQUIRED",
+                    exitCode: .usageError,
+                    message: "Converting an all-day event to timed requires a time component on --start (e.g. '2026-11-21T09:00' or 'tomorrow 09:00')."
+                )
+            }
+            let newStart = try parsedStart.startOfDayDate(calendar: calendar)
+            let newEnd: Date
+            if let endRaw {
+                newEnd = try DateParsing.parseTemporal(endRaw, now: now, calendar: calendar, timeZone: timeZone).startOfDayDate(calendar: calendar)
+            } else if let durationRaw {
+                newEnd = newStart.addingTimeInterval(try DateParsing.parseDuration(durationRaw))
+            } else {
+                newEnd = newStart.addingTimeInterval(3600)
+            }
+            guard newEnd > newStart else {
+                throw DaykitError(code: "INVALID_RANGE", exitCode: .usageError, message: "--end must be strictly after --start.")
+            }
+            return (newStart, newEnd)
+        }
+
+        if targetAllDay {
+            if durationRaw != nil {
+                throw DaykitError(code: "CONFLICTING_FLAGS", exitCode: .usageError, message: "Use --end YYYY-MM-DD instead of --duration with all-day events.")
+            }
+            let rawStart: Date
+            if let startRaw {
+                rawStart = try DateParsing.parseTemporal(startRaw, now: now, calendar: calendar, timeZone: timeZone).startOfDayDate(calendar: calendar)
+            } else {
+                rawStart = oldStartDate
+            }
+            let newStart = calendar.startOfDay(for: rawStart)
+
+            let newEnd: Date
+            if let endRaw {
+                let parsedEnd = try DateParsing.parseTemporal(endRaw, now: now, calendar: calendar, timeZone: timeZone).startOfDayDate(calendar: calendar)
+                newEnd = calendar.startOfDay(for: parsedEnd)
+            } else if startRaw != nil {
+                let daySpan = max(calendar.dateComponents([.day], from: calendar.startOfDay(for: oldStartDate), to: calendar.startOfDay(for: oldEndDate)).day ?? 0, 0)
+                newEnd = calendar.date(byAdding: .day, value: daySpan, to: newStart) ?? newStart
+            } else {
+                newEnd = calendar.startOfDay(for: oldEndDate)
+            }
+            guard newEnd >= newStart else {
+                throw DaykitError(code: "INVALID_RANGE", exitCode: .usageError, message: "--end must be >= --start for all-day events.")
+            }
+            return (newStart, newEnd)
+        }
+
+        let newStart: Date
+        if let startRaw {
+            newStart = try DateParsing.parseTemporal(startRaw, now: now, calendar: calendar, timeZone: timeZone).startOfDayDate(calendar: calendar)
+        } else {
+            newStart = oldStartDate
+        }
+
+        let newEnd: Date
+        if let endRaw {
+            newEnd = try DateParsing.parseTemporal(endRaw, now: now, calendar: calendar, timeZone: timeZone).startOfDayDate(calendar: calendar)
+        } else if let durationRaw {
+            newEnd = newStart.addingTimeInterval(try DateParsing.parseDuration(durationRaw))
+        } else if startRaw != nil {
+            let previousDuration = max(oldEndDate.timeIntervalSince(oldStartDate), 60)
+            newEnd = newStart.addingTimeInterval(previousDuration)
+        } else {
+            newEnd = oldEndDate
+        }
+
+        guard newEnd > newStart else {
+            throw DaykitError(code: "INVALID_RANGE", exitCode: .usageError, message: "--end must be strictly after --start.")
+        }
+        return (newStart, newEnd)
+    }
+
+    private func applyEventPreview(
+        existing: EventRecord,
+        title: String?,
+        startDate: Date,
+        endDate: Date,
+        targetAllDay: Bool,
+        destinationCal: CalendarSummary,
+        locationPatch: FieldPatch<String>,
+        notesPatch: FieldPatch<String>,
+        urlPatch: FieldPatch<String>,
+        alarmsPatch: FieldPatch<[Int]>
+    ) -> EventRecord {
+        let newLocation: String?
+        switch locationPatch {
+        case .unchanged: newLocation = existing.location
+        case .clear: newLocation = nil
+        case .set(let v): newLocation = v.isEmpty ? nil : v
+        }
+
+        let newNotes: String?
+        switch notesPatch {
+        case .unchanged: newNotes = existing.notes
+        case .clear: newNotes = nil
+        case .set(let v): newNotes = v.isEmpty ? nil : v
+        }
+
+        let newURL: String?
+        switch urlPatch {
+        case .unchanged: newURL = existing.url
+        case .clear: newURL = nil
+        case .set(let v): newURL = v
+        }
+
+        let newAlarms: [Int]
+        switch alarmsPatch {
+        case .unchanged: newAlarms = existing.alarmsMinutesBefore
+        case .clear: newAlarms = []
+        case .set(let v): newAlarms = v
+        }
+
+        let startStr = targetAllDay ? DateParsing.formatDateOnly(startDate, calendar: calendar) : DateParsing.formatRFC3339(startDate, timeZone: timeZone)
+        let endStr = targetAllDay ? DateParsing.formatDateOnly(endDate, calendar: calendar) : DateParsing.formatRFC3339(endDate, timeZone: timeZone)
+
+        return EventRecord(
+            instanceId: existing.instanceId,
+            seriesId: existing.seriesId,
+            title: title ?? existing.title,
+            startAt: startStr,
+            endAt: endStr,
+            allDay: targetAllDay,
+            timezone: targetAllDay ? nil : (existing.timezone ?? timeZone.identifier),
+            calendarId: destinationCal.id,
+            calendarTitle: destinationCal.title,
+            location: newLocation,
+            notes: newNotes,
+            hasNotes: !(newNotes?.isEmpty ?? true),
+            notesTruncated: false,
+            url: newURL,
+            availability: existing.availability,
+            status: existing.status,
+            isRecurring: existing.isRecurring,
+            isDetached: existing.isDetached,
+            occurrenceDate: existing.occurrenceDate,
+            alarmsMinutesBefore: newAlarms,
+            attendees: existing.attendees
+        )
+    }
+
+    private func runCalDelete(id: String, span: EventSpan?, dryRun: Bool, yes: Bool) async throws -> DeleteEventResult {
+        try ensureNotReadOnly()
+        try await ensureReadableAccess(for: .calendars)
+
+        guard let existing = try await store.findEvent(instanceId: id) else {
+            throw DaykitError(code: "EVENT_NOT_FOUND", exitCode: .notFound, message: "Event '\(id)' not found.")
+        }
+
+        let calendars = try await store.listCalendars()
+        guard let sourceCal = calendars.first(where: { $0.id == existing.calendarId }) else {
+            throw DaykitError(code: "CALENDAR_NOT_FOUND", exitCode: .notFound, message: "Parent calendar for event '\(id)' not found.")
+        }
+        try ensureCalendarWritable(sourceCal)
+
+        if (existing.isRecurring || existing.isDetached) && span == nil {
+            throw DaykitError(
+                code: "SPAN_REQUIRED",
+                exitCode: .usageError,
+                message: "Event '\(existing.instanceId)' is recurring/detached; specify --span this or --span future."
+            )
+        }
+        let effectiveSpan = span ?? .this
+
+        if !dryRun && !yes {
+            throw DaykitError(
+                code: "CONFIRMATION_REQUIRED",
+                exitCode: .usageError,
+                message: "Deleting an event is permanent across synced accounts; pass --yes to confirm or preview with --dry-run."
+            )
+        }
+
+        if dryRun {
+            return DeleteEventResult(
+                dryRun: true,
+                action: "delete_event",
+                deletedId: existing.instanceId,
+                span: effectiveSpan,
+                event: existing,
+                auditLogged: false
+            )
+        }
+
+        let auditLogged = try recordAudit(action: "delete_event", targetId: existing.instanceId, span: effectiveSpan, event: existing)
+        let deleted = try await store.deleteEvent(instanceId: existing.instanceId, span: effectiveSpan)
+        return DeleteEventResult(
+            dryRun: false,
+            action: "delete_event",
+            deletedId: deleted.instanceId,
+            span: effectiveSpan,
+            event: deleted,
+            auditLogged: auditLogged
+        )
+    }
+
+    private func parseDueSpec(_ raw: String) throws -> (ReminderDueUpdate, String) {
+        let parsed = try DateParsing.parseTemporal(raw, now: now, calendar: calendar, timeZone: timeZone)
+        switch parsed {
+        case .dateOnly(let year, let month, let day):
+            var comps = DateComponents()
+            comps.year = year
+            comps.month = month
+            comps.day = day
+            return (
+                ReminderDueUpdate(dueComponents: comps, hasDueTime: false, dueAlarmDate: nil),
+                String(format: "%04d-%02d-%02d", year, month, day)
+            )
+        case .dateTime(let date):
+            var comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+            comps.timeZone = timeZone
+            return (
+                ReminderDueUpdate(dueComponents: comps, hasDueTime: true, dueAlarmDate: date),
+                DateParsing.formatRFC3339(date, timeZone: timeZone)
+            )
+        }
+    }
+
     private func runRemAdd(
         title: String,
         listRef: String?,
@@ -580,24 +1015,11 @@ public struct DaykitApp: Sendable {
         var formattedDue: String?
 
         if let dueRaw {
-            let parsed = try DateParsing.parseTemporal(dueRaw, now: now, calendar: calendar, timeZone: timeZone)
-            switch parsed {
-            case .dateOnly(let year, let month, let day):
-                var comps = DateComponents()
-                comps.year = year
-                comps.month = month
-                comps.day = day
-                dueComponents = comps
-                hasDueTime = false
-                formattedDue = String(format: "%04d-%02d-%02d", year, month, day)
-            case .dateTime(let date):
-                var comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
-                comps.timeZone = timeZone
-                dueComponents = comps
-                hasDueTime = true
-                dueAlarmDate = date
-                formattedDue = DateParsing.formatRFC3339(date, timeZone: timeZone)
-            }
+            let (update, formatted) = try parseDueSpec(dueRaw)
+            dueComponents = update.dueComponents
+            hasDueTime = update.hasDueTime
+            dueAlarmDate = update.dueAlarmDate
+            formattedDue = formatted
         }
 
         let validatedURL = try urlRaw.map(DateParsing.validateHTTPSURL)
@@ -632,6 +1054,110 @@ public struct DaykitApp: Sendable {
         return CreateReminderResult(dryRun: false, action: "create_reminder", preview: nil, reminder: created)
     }
 
+    private func runRemUpdate(
+        id: String,
+        title: String?,
+        listRef: String?,
+        duePatch: FieldPatch<String>,
+        priority: PriorityLevel?,
+        notesPatch: FieldPatch<String>,
+        urlPatch: FieldPatch<String>,
+        dryRun: Bool
+    ) async throws -> UpdateReminderResult {
+        try ensureNotReadOnly()
+        try await ensureReadableAccess(for: .reminders)
+
+        guard let existing = try await store.findReminder(id: id) else {
+            throw DaykitError(code: "REMINDER_NOT_FOUND", exitCode: .notFound, message: "Reminder '\(id)' not found.")
+        }
+
+        let lists = try await store.listReminderLists()
+        guard let sourceList = lists.first(where: { $0.id == existing.listId }) else {
+            throw DaykitError(code: "LIST_NOT_FOUND", exitCode: .notFound, message: "Parent reminder list for '\(id)' not found.")
+        }
+        try ensureListWritable(sourceList)
+
+        let destinationList: ReminderListSummary
+        if let listRef {
+            destinationList = try await resolveSingleWritableList(listRef)
+        } else {
+            destinationList = sourceList
+        }
+
+        let parsedDuePatch: FieldPatch<ReminderDueUpdate>
+        let formattedDuePreview: String?
+        let hasDueTimePreview: Bool
+        switch duePatch {
+        case .unchanged:
+            parsedDuePatch = .unchanged
+            formattedDuePreview = existing.dueAt
+            hasDueTimePreview = existing.hasDueTime
+        case .clear:
+            parsedDuePatch = .clear
+            formattedDuePreview = nil
+            hasDueTimePreview = false
+        case .set(let raw):
+            let (dueUpdate, formatted) = try parseDueSpec(raw)
+            parsedDuePatch = .set(dueUpdate)
+            formattedDuePreview = formatted
+            hasDueTimePreview = dueUpdate.hasDueTime
+        }
+
+        let validatedURLPatch: FieldPatch<String>
+        switch urlPatch {
+        case .unchanged: validatedURLPatch = .unchanged
+        case .clear: validatedURLPatch = .clear
+        case .set(let raw): validatedURLPatch = .set(try DateParsing.validateHTTPSURL(raw))
+        }
+
+        if dryRun {
+            let newNotes: String?
+            switch notesPatch {
+            case .unchanged: newNotes = existing.notes
+            case .clear: newNotes = nil
+            case .set(let v): newNotes = v.isEmpty ? nil : v
+            }
+            let newURL: String?
+            switch validatedURLPatch {
+            case .unchanged: newURL = existing.url
+            case .clear: newURL = nil
+            case .set(let v): newURL = v
+            }
+            let afterPreview = ReminderRecord(
+                id: existing.id,
+                title: title ?? existing.title,
+                listId: destinationList.id,
+                listTitle: destinationList.title,
+                dueAt: formattedDuePreview,
+                hasDueTime: hasDueTimePreview,
+                completed: existing.completed,
+                completionDate: existing.completionDate,
+                priority: priority ?? existing.priority,
+                notes: newNotes,
+                hasNotes: !(newNotes?.isEmpty ?? true),
+                notesTruncated: false,
+                url: newURL,
+                isRecurring: existing.isRecurring,
+                createdAt: existing.createdAt,
+                modifiedAt: existing.modifiedAt
+            )
+            return UpdateReminderResult(dryRun: true, action: "update_reminder", before: existing, after: afterPreview, auditLogged: false)
+        }
+
+        let auditLogged = try recordAudit(action: "update_reminder", targetId: existing.id, reminder: existing)
+        let input = ReminderUpdateInput(
+            id: existing.id,
+            title: title,
+            listId: listRef != nil ? destinationList.id : nil,
+            due: parsedDuePatch,
+            priority: priority,
+            notes: notesPatch,
+            url: validatedURLPatch
+        )
+        let updated = try await store.updateReminder(input)
+        return UpdateReminderResult(dryRun: false, action: "update_reminder", before: existing, after: updated, auditLogged: auditLogged)
+    }
+
     private func runRemDone(id: String, dryRun: Bool) async throws -> CompleteReminderResult {
         try ensureNotReadOnly()
         try await ensureReadableAccess(for: .reminders)
@@ -644,20 +1170,7 @@ public struct DaykitApp: Sendable {
         guard let list = lists.first(where: { $0.id == existing.listId }) else {
             throw DaykitError(code: "LIST_NOT_FOUND", exitCode: .notFound, message: "Parent reminder list for '\(id)' not found.")
         }
-        try ensureAllowedByPolicy(
-            targetId: list.id,
-            title: list.title,
-            sourceName: list.sourceName,
-            allowlist: policy.writableLists,
-            domainLabel: "reminder list"
-        )
-        guard list.writable else {
-            throw DaykitError(
-                code: "LIST_READ_ONLY",
-                exitCode: .permissionOrPolicyDenied,
-                message: "Reminder list '\(list.sourceName)/\(list.title)' does not allow modifications."
-            )
-        }
+        try ensureListWritable(list)
 
         if dryRun {
             return CompleteReminderResult(
@@ -673,6 +1186,37 @@ public struct DaykitApp: Sendable {
         }
 
         return try await store.completeReminder(id: id)
+    }
+
+    private func runRemDelete(id: String, dryRun: Bool, yes: Bool) async throws -> DeleteReminderResult {
+        try ensureNotReadOnly()
+        try await ensureReadableAccess(for: .reminders)
+
+        guard let existing = try await store.findReminder(id: id) else {
+            throw DaykitError(code: "REMINDER_NOT_FOUND", exitCode: .notFound, message: "Reminder '\(id)' not found.")
+        }
+
+        let lists = try await store.listReminderLists()
+        guard let list = lists.first(where: { $0.id == existing.listId }) else {
+            throw DaykitError(code: "LIST_NOT_FOUND", exitCode: .notFound, message: "Parent reminder list for '\(id)' not found.")
+        }
+        try ensureListWritable(list)
+
+        if !dryRun && !yes {
+            throw DaykitError(
+                code: "CONFIRMATION_REQUIRED",
+                exitCode: .usageError,
+                message: "Deleting a reminder is permanent across synced accounts; pass --yes to confirm or preview with --dry-run."
+            )
+        }
+
+        if dryRun {
+            return DeleteReminderResult(dryRun: true, action: "delete_reminder", deletedId: existing.id, reminder: existing, auditLogged: false)
+        }
+
+        let auditLogged = try recordAudit(action: "delete_reminder", targetId: existing.id, reminder: existing)
+        let deleted = try await store.deleteReminder(id: existing.id)
+        return DeleteReminderResult(dryRun: false, action: "delete_reminder", deletedId: deleted.id, reminder: deleted, auditLogged: auditLogged)
     }
 
     private func runBriefing(
@@ -818,6 +1362,8 @@ public struct DaykitApp: Sendable {
               week                       List events for the next 7 days
               list                       List events in a range (--from, --to)
               add                        Create a new calendar event
+              update                     Update an existing event by --id
+              delete                     Delete an event by --id (requires --yes)
 
             Common options:
               --calendar <ref>           Filter or target by ID, <Source>/<Title>, or <Title>
@@ -830,7 +1376,7 @@ public struct DaykitApp: Sendable {
 
             Options:
               --title <text>             Event title (required)
-              --start <spec>             YYYY-MM-DD, YYYY-MM-DDTHH:MM, RFC3339, today/+Nd (required)
+              --start <spec>             YYYY-MM-DD, YYYY-MM-DDTHH:MM, RFC3339, today/+Nd, or 'tomorrow 09:00'
               --end <spec>               End date/time (exclusive of --duration)
               --duration <dur>           Duration such as 30m, 1h, 1h30m (default 1h)
               --all-day                  Create an all-day event (date-only --start/--end)
@@ -840,6 +1386,36 @@ public struct DaykitApp: Sendable {
               --url <https-url>          Associated https:// URL
               --alarm <dur>              Reminder alarm before start (repeatable, e.g. 15m)
               --dry-run                  Validate and preview without writing to EventKit
+            """
+        case "cal update":
+            return """
+            Usage: daykit cal update --id <instance_id> [options]
+
+            Options:
+              --id <instance_id>         Event instance_id from 'cal list/today/week' (required)
+              --title <text>             New event title
+              --start <spec>             New start (e.g. 'tomorrow 10:00' or RFC3339)
+              --end <spec>               New end date/time (exclusive of --duration)
+              --duration <dur>           New duration (exclusive of --end)
+              --all-day / --no-all-day   Switch all-day mode (no-all-day requires timed --start)
+              --calendar <ref>           Move event to another writable calendar
+              --location / --clear-location
+              --notes / --clear-notes
+              --url / --clear-url
+              --alarm / --clear-alarms
+              --span this|future         Required for recurring/detached events
+              --yes                      Required when using --span future
+              --dry-run                  Preview before/after without writing
+            """
+        case "cal delete":
+            return """
+            Usage: daykit cal delete --id <instance_id> [--span this|future] [--yes] [--dry-run]
+
+            Options:
+              --id <instance_id>         Event instance_id from 'cal list/today/week' (required)
+              --span this|future         Required for recurring/detached events
+              --yes                      Required to execute permanent deletion
+              --dry-run                  Preview deleted event without writing
             """
         case "rem":
             return """
@@ -851,7 +1427,9 @@ public struct DaykitApp: Sendable {
               overdue                    List open overdue reminders
               today                      List open reminders due later today
               add                        Create a new reminder
+              update                     Update an existing reminder by --id
               done                       Mark a reminder completed by --id
+              delete                     Delete a reminder by --id (requires --yes)
             """
         case "rem add":
             return """
@@ -860,11 +1438,35 @@ public struct DaykitApp: Sendable {
             Options:
               --title <text>             Reminder title (required)
               --list <ref>               Target list (defaults to system default)
-              --due <spec>               Due YYYY-MM-DD (date-only) or YYYY-MM-DDTHH:MM
+              --due <spec>               Due date or datetime (e.g. 2026-11-22 or 'tomorrow 09:00')
               --priority <level>         none | low | medium | high (default none)
               --notes <text>             Reminder notes
               --url <https-url>          Associated https:// URL
               --dry-run                  Validate and preview without writing to EventKit
+            """
+        case "rem update":
+            return """
+            Usage: daykit rem update --id <id> [options]
+
+            Options:
+              --id <id>                  Reminder ID from 'rem list/overdue/today/briefing' (required)
+              --title <text>             New reminder title
+              --list <ref>               Move reminder to another writable list
+              --due <spec>               New due date/time (e.g. 'tomorrow 09:00')
+              --clear-due                Remove existing due date and absolute alarms
+              --priority <level>         none | low | medium | high
+              --notes / --clear-notes
+              --url / --clear-url
+              --dry-run                  Preview before/after without writing
+            """
+        case "rem delete":
+            return """
+            Usage: daykit rem delete --id <id> [--yes] [--dry-run]
+
+            Options:
+              --id <id>                  Reminder ID (required)
+              --yes                      Required to execute permanent deletion
+              --dry-run                  Preview deleted reminder without writing
             """
         default:
             return """
@@ -874,8 +1476,8 @@ public struct DaykitApp: Sendable {
 
             Commands:
               briefing                   Overdue reminders + today/upcoming events in one call
-              cal <subcommand>           Read calendars/events and create new events
-              rem <subcommand>           Read lists/reminders, add items, mark done
+              cal <subcommand>           calendars | today | week | list | add | update | delete
+              rem <subcommand>           lists | list | overdue | today | add | update | done | delete
               doctor                     Inspect TCC status, active session, policy, defaults
 
             Global options:
@@ -886,8 +1488,10 @@ public struct DaykitApp: Sendable {
 
             Environment guardrails:
               DAYKIT_READ_ONLY=1         Block all write operations (exit 3)
-              DAYKIT_WRITABLE_CALENDARS  Comma-separated allowlist for cal add
-              DAYKIT_WRITABLE_LISTS      Comma-separated allowlist for rem add/done
+              DAYKIT_WRITABLE_CALENDARS  Comma-separated allowlist for cal writes
+              DAYKIT_WRITABLE_LISTS      Comma-separated allowlist for rem writes
+              DAYKIT_AUDIT_LOG           Override pre-mutation JSONL audit path (default ~/.local/state/daykit/audit.jsonl)
+              DAYKIT_DISABLE_AUDIT_LOG=1 Disable pre-mutation JSONL audit snapshots
             """
         }
     }

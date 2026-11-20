@@ -42,6 +42,7 @@ jobs:
       - name: Smoke checks (no TCC prompt)
         run: |
           BIN="$(swift build -c release --show-bin-path)/daykit"
-          test "$("$BIN" --version)" = "0.1.0"
+          EXPECTED_VER="$(sed -n 's/.*public static let current = "\([^"]*\)".*/\1/p' Sources/DaykitCore/Domain.swift)"
+          test "$("$BIN" --version)" = "$EXPECTED_VER"
           "$BIN" --help >/dev/null
-          "$BIN" doctor | jq -e '.schema_version == 1 and .ok == true and .data.daykit_version == "0.1.0"'
+          "$BIN" doctor | jq -e --arg v "$EXPECTED_VER" '.schema_version == 1 and .ok == true and .data.daykit_version == $v'

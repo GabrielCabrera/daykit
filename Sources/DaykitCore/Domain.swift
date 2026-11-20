@@ -1,7 +1,7 @@
 import Foundation
 
 public enum DaykitVersion {
-    public static let current = "0.1.0"
+    public static let current = "0.2.0"
     public static let schemaVersion = 1
 }
 
@@ -102,6 +102,49 @@ public enum DoctorAccessRequest: String, Sendable, Equatable {
     case all
 }
 
+public enum EventSpan: String, Sendable, Codable, Equatable {
+    case this
+    case future
+}
+
+public struct EventInstanceRef: Sendable, Equatable {
+    public let seriesId: String
+    public let occurrenceDate: Date?
+
+    public init(seriesId: String, occurrenceDate: Date?) {
+        self.seriesId = seriesId
+        self.occurrenceDate = occurrenceDate
+    }
+
+    /// Splits `<series_id>@<utc_iso8601>` only at the last `@` when the suffix is a valid
+    /// RFC3339 timestamp, preserving external CalDAV/Google UIDs containing `@`.
+    public static func parse(_ raw: String) -> EventInstanceRef {
+        guard let atIdx = raw.lastIndex(of: "@") else {
+            return EventInstanceRef(seriesId: raw, occurrenceDate: nil)
+        }
+        let prefix = String(raw[..<atIdx])
+        let suffix = String(raw[raw.index(after: atIdx)...])
+        guard !prefix.isEmpty, !suffix.isEmpty else {
+            return EventInstanceRef(seriesId: raw, occurrenceDate: nil)
+        }
+        if let occDate = DateParsing.parseISO8601Timestamp(suffix) {
+            return EventInstanceRef(seriesId: prefix, occurrenceDate: occDate)
+        }
+        return EventInstanceRef(seriesId: raw, occurrenceDate: nil)
+    }
+}
+
+public enum FieldPatch<T: Sendable & Equatable>: Sendable, Equatable {
+    case unchanged
+    case set(T)
+    case clear
+
+    public var isMutating: Bool {
+        if case .unchanged = self { return false }
+        return true
+    }
+}
+
 public struct SessionInfo: Sendable, Codable, Equatable {
     public let isSSH: Bool
     public let hasAquaGUI: Bool
@@ -121,25 +164,63 @@ public struct RuntimePolicy: Sendable, Codable, Equatable {
     public let readOnly: Bool
     public let writableCalendars: [String]
     public let writableLists: [String]
+    public let auditLogEnabled: Bool
+    public let auditLogPath: String?
 
     enum CodingKeys: String, CodingKey {
         case readOnly = "read_only"
         case writableCalendars = "writable_calendars"
         case writableLists = "writable_lists"
+        case auditLogEnabled = "audit_log_enabled"
+        case auditLogPath = "audit_log_path"
     }
 
-    public init(readOnly: Bool = false, writableCalendars: [String] = [], writableLists: [String] = []) {
+    public init(
+        readOnly: Bool = false,
+        writableCalendars: [String] = [],
+        writableLists: [String] = [],
+        auditLogEnabled: Bool = true,
+        auditLogPath: String? = nil
+    ) {
         self.readOnly = readOnly
         self.writableCalendars = writableCalendars
         self.writableLists = writableLists
+        self.auditLogEnabled = auditLogEnabled
+        self.auditLogPath = auditLogPath
     }
 
     public static func fromEnvironment(_ environment: [String: String]) -> RuntimePolicy {
+        let truthy = Set(["1", "true", "yes", "on"])
         let rawReadOnly = environment["DAYKIT_READ_ONLY"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        let readOnly = ["1", "true", "yes", "on"].contains(rawReadOnly)
+        let readOnly = truthy.contains(rawReadOnly)
         let calendars = parseAllowlist(environment["DAYKIT_WRITABLE_CALENDARS"])
         let lists = parseAllowlist(environment["DAYKIT_WRITABLE_LISTS"])
-        return RuntimePolicy(readOnly: readOnly, writableCalendars: calendars, writableLists: lists)
+
+        let rawDisableAudit = environment["DAYKIT_DISABLE_AUDIT_LOG"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let auditEnabled = !truthy.contains(rawDisableAudit)
+
+        let resolvedAuditPath: String?
+        if auditEnabled {
+            if let explicit = environment["DAYKIT_AUDIT_LOG"]?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty {
+                resolvedAuditPath = explicit
+            } else if let xdgState = environment["XDG_STATE_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines), !xdgState.isEmpty {
+                resolvedAuditPath = URL(fileURLWithPath: xdgState).appendingPathComponent("daykit/audit.jsonl").path
+            } else {
+                let home = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let baseHome = (home?.isEmpty == false) ? home! : FileManager.default.homeDirectoryForCurrentUser.path
+                resolvedAuditPath = URL(fileURLWithPath: baseHome).appendingPathComponent(".local/state/daykit/audit.jsonl").path
+            }
+        } else {
+            resolvedAuditPath = nil
+        }
+
+        return RuntimePolicy(
+            readOnly: readOnly,
+            writableCalendars: calendars,
+            writableLists: lists,
+            auditLogEnabled: auditEnabled,
+            auditLogPath: resolvedAuditPath
+        )
     }
 
     private static func parseAllowlist(_ raw: String?) -> [String] {
@@ -663,6 +744,58 @@ public struct EventCreateInput: Sendable, Equatable {
     }
 }
 
+public struct EventUpdateInput: Sendable, Equatable {
+    public let instanceId: String
+    public let span: EventSpan
+    public let title: String?
+    public let startDate: Date?
+    public let endDate: Date?
+    public let allDay: Bool?
+    public let calendarId: String?
+    public let location: FieldPatch<String>
+    public let notes: FieldPatch<String>
+    public let url: FieldPatch<String>
+    public let alarmsMinutesBefore: FieldPatch<[Int]>
+
+    public init(
+        instanceId: String,
+        span: EventSpan,
+        title: String?,
+        startDate: Date?,
+        endDate: Date?,
+        allDay: Bool?,
+        calendarId: String?,
+        location: FieldPatch<String>,
+        notes: FieldPatch<String>,
+        url: FieldPatch<String>,
+        alarmsMinutesBefore: FieldPatch<[Int]>
+    ) {
+        self.instanceId = instanceId
+        self.span = span
+        self.title = title
+        self.startDate = startDate
+        self.endDate = endDate
+        self.allDay = allDay
+        self.calendarId = calendarId
+        self.location = location
+        self.notes = notes
+        self.url = url
+        self.alarmsMinutesBefore = alarmsMinutesBefore
+    }
+}
+
+public struct ReminderDueUpdate: Sendable, Equatable {
+    public let dueComponents: DateComponents
+    public let hasDueTime: Bool
+    public let dueAlarmDate: Date?
+
+    public init(dueComponents: DateComponents, hasDueTime: Bool, dueAlarmDate: Date?) {
+        self.dueComponents = dueComponents
+        self.hasDueTime = hasDueTime
+        self.dueAlarmDate = dueAlarmDate
+    }
+}
+
 public struct ReminderCreateInput: Sendable, Equatable {
     public let title: String
     public let listId: String
@@ -688,6 +821,34 @@ public struct ReminderCreateInput: Sendable, Equatable {
         self.dueComponents = dueComponents
         self.hasDueTime = hasDueTime
         self.dueAlarmDate = dueAlarmDate
+        self.priority = priority
+        self.notes = notes
+        self.url = url
+    }
+}
+
+public struct ReminderUpdateInput: Sendable, Equatable {
+    public let id: String
+    public let title: String?
+    public let listId: String?
+    public let due: FieldPatch<ReminderDueUpdate>
+    public let priority: PriorityLevel?
+    public let notes: FieldPatch<String>
+    public let url: FieldPatch<String>
+
+    public init(
+        id: String,
+        title: String?,
+        listId: String?,
+        due: FieldPatch<ReminderDueUpdate>,
+        priority: PriorityLevel?,
+        notes: FieldPatch<String>,
+        url: FieldPatch<String>
+    ) {
+        self.id = id
+        self.title = title
+        self.listId = listId
+        self.due = due
         self.priority = priority
         self.notes = notes
         self.url = url
@@ -765,6 +926,60 @@ public struct CreateEventResult: Sendable, Codable, Equatable {
     }
 }
 
+public struct UpdateEventResult: Sendable, Codable, Equatable {
+    public let dryRun: Bool
+    public let action: String
+    public let span: EventSpan
+    public let before: EventRecord
+    public let after: EventRecord
+    public let auditLogged: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case dryRun = "dry_run"
+        case action
+        case span
+        case before
+        case after
+        case auditLogged = "audit_logged"
+    }
+
+    public init(dryRun: Bool, action: String, span: EventSpan, before: EventRecord, after: EventRecord, auditLogged: Bool) {
+        self.dryRun = dryRun
+        self.action = action
+        self.span = span
+        self.before = before
+        self.after = after
+        self.auditLogged = auditLogged
+    }
+}
+
+public struct DeleteEventResult: Sendable, Codable, Equatable {
+    public let dryRun: Bool
+    public let action: String
+    public let deletedId: String
+    public let span: EventSpan
+    public let event: EventRecord
+    public let auditLogged: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case dryRun = "dry_run"
+        case action
+        case deletedId = "deleted_id"
+        case span
+        case event
+        case auditLogged = "audit_logged"
+    }
+
+    public init(dryRun: Bool, action: String, deletedId: String, span: EventSpan, event: EventRecord, auditLogged: Bool) {
+        self.dryRun = dryRun
+        self.action = action
+        self.deletedId = deletedId
+        self.span = span
+        self.event = event
+        self.auditLogged = auditLogged
+    }
+}
+
 public struct CreateReminderPreview: Sendable, Codable, Equatable {
     public let listId: String
     public let listTitle: String
@@ -825,6 +1040,54 @@ public struct CreateReminderResult: Sendable, Codable, Equatable {
         self.action = action
         self.preview = preview
         self.reminder = reminder
+    }
+}
+
+public struct UpdateReminderResult: Sendable, Codable, Equatable {
+    public let dryRun: Bool
+    public let action: String
+    public let before: ReminderRecord
+    public let after: ReminderRecord
+    public let auditLogged: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case dryRun = "dry_run"
+        case action
+        case before
+        case after
+        case auditLogged = "audit_logged"
+    }
+
+    public init(dryRun: Bool, action: String, before: ReminderRecord, after: ReminderRecord, auditLogged: Bool) {
+        self.dryRun = dryRun
+        self.action = action
+        self.before = before
+        self.after = after
+        self.auditLogged = auditLogged
+    }
+}
+
+public struct DeleteReminderResult: Sendable, Codable, Equatable {
+    public let dryRun: Bool
+    public let action: String
+    public let deletedId: String
+    public let reminder: ReminderRecord
+    public let auditLogged: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case dryRun = "dry_run"
+        case action
+        case deletedId = "deleted_id"
+        case reminder
+        case auditLogged = "audit_logged"
+    }
+
+    public init(dryRun: Bool, action: String, deletedId: String, reminder: ReminderRecord, auditLogged: Bool) {
+        self.dryRun = dryRun
+        self.action = action
+        self.deletedId = deletedId
+        self.reminder = reminder
+        self.auditLogged = auditLogged
     }
 }
 

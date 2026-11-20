@@ -8,8 +8,14 @@ enum DaykitMain {
         let args = Array(CommandLine.arguments.dropFirst())
         let isTTY = isatty(STDOUT_FILENO) == 1
         let policy = RuntimePolicy.fromEnvironment(ProcessInfo.processInfo.environment)
+        let auditWriter: AuditLogWriter
+        if policy.auditLogEnabled, let path = policy.auditLogPath, !path.isEmpty {
+            auditWriter = FileAuditLogWriter(path: path)
+        } else {
+            auditWriter = NoopAuditLogWriter()
+        }
         let store = LiveEventKitStore()
-        let app = DaykitApp(store: store, policy: policy, isTTY: isTTY)
+        let app = DaykitApp(store: store, policy: policy, auditWriter: auditWriter, isTTY: isTTY)
         let output = await app.run(arguments: args)
 
         if !output.stdout.isEmpty {

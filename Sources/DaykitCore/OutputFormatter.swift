@@ -209,6 +209,29 @@ public enum OutputFormatting {
         }.joined(separator: "\n") + "\n"
     }
 
+    public static func renderPlainUpdateEvent(_ result: UpdateEventResult) -> String {
+        let mode = result.dryRun ? " (dry-run)" : ""
+        let ev = result.after
+        return "Updated event\(mode) [span=\(result.span.rawValue)]: \(stripControlAndANSI(ev.title)) (\(ev.startAt) -> \(ev.endAt)) [\(stripControlAndANSI(ev.calendarTitle))]  id=\(ev.instanceId)\n"
+    }
+
+    public static func renderPlainDeleteEvent(_ result: DeleteEventResult) -> String {
+        let mode = result.dryRun ? " (dry-run)" : ""
+        return "Deleted event\(mode) [span=\(result.span.rawValue)]: \(stripControlAndANSI(result.event.title))  id=\(result.deletedId)\n"
+    }
+
+    public static func renderPlainUpdateReminder(_ result: UpdateReminderResult) -> String {
+        let mode = result.dryRun ? " (dry-run)" : ""
+        let rem = result.after
+        let due = rem.dueAt ?? "no-due"
+        return "Updated reminder\(mode): \(stripControlAndANSI(rem.title)) (\(due), !\(rem.priority.rawValue)) [\(stripControlAndANSI(rem.listTitle))]  id=\(rem.id)\n"
+    }
+
+    public static func renderPlainDeleteReminder(_ result: DeleteReminderResult) -> String {
+        let mode = result.dryRun ? " (dry-run)" : ""
+        return "Deleted reminder\(mode): \(stripControlAndANSI(result.reminder.title))  id=\(result.deletedId)\n"
+    }
+
     public static func renderPlainBriefing(_ payload: BriefingPayload) -> String {
         var lines: [String] = []
         lines.append("Briefing (\(payload.windowFrom) -> \(payload.windowTo))")
@@ -233,8 +256,11 @@ public enum OutputFormatting {
             "daykit \(doctor.daykitVersion) (\(doctor.arch), macOS \(doctor.macosVersion))",
             "Session: ssh=\(doctor.session.isSSH), aqua_gui=\(doctor.session.hasAquaGUI)",
             "Permissions: calendars=\(doctor.permissions.calendars.rawValue), reminders=\(doctor.permissions.reminders.rawValue)",
-            "Policy: read_only=\(doctor.policy.readOnly), writable_calendars=\(doctor.policy.writableCalendars.joined(separator: ",")), writable_lists=\(doctor.policy.writableLists.joined(separator: ","))"
+            "Policy: read_only=\(doctor.policy.readOnly), writable_calendars=\(doctor.policy.writableCalendars.joined(separator: ",")), writable_lists=\(doctor.policy.writableLists.joined(separator: ",")), audit_log_enabled=\(doctor.policy.auditLogEnabled)"
         ]
+        if let auditPath = doctor.policy.auditLogPath {
+            lines.append("Audit log: \(auditPath)")
+        }
         if let defCal = doctor.defaultCalendar {
             lines.append("Default calendar: \(stripControlAndANSI(defCal.title)) [\(defCal.sourceName)] (\(defCal.id))")
         }

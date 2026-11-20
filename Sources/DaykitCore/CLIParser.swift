@@ -27,6 +27,23 @@ public enum ParsedCommand: Sendable, Equatable {
         alarms: [String],
         dryRun: Bool
     )
+    case calUpdate(
+        id: String,
+        title: String?,
+        start: String?,
+        end: String?,
+        duration: String?,
+        allDay: Bool?,
+        calendarRef: String?,
+        location: FieldPatch<String>,
+        notes: FieldPatch<String>,
+        url: FieldPatch<String>,
+        alarms: FieldPatch<[String]>,
+        span: EventSpan?,
+        dryRun: Bool,
+        yes: Bool
+    )
+    case calDelete(id: String, span: EventSpan?, dryRun: Bool, yes: Bool)
     case remLists
     case remList(listRefs: [String], filter: ReminderCompletionFilter, maxNotesBytes: Int)
     case remOverdue(listRefs: [String], maxNotesBytes: Int)
@@ -40,7 +57,18 @@ public enum ParsedCommand: Sendable, Equatable {
         url: String?,
         dryRun: Bool
     )
+    case remUpdate(
+        id: String,
+        title: String?,
+        listRef: String?,
+        due: FieldPatch<String>,
+        priority: PriorityLevel?,
+        notes: FieldPatch<String>,
+        url: FieldPatch<String>,
+        dryRun: Bool
+    )
     case remDone(id: String, dryRun: Bool)
+    case remDelete(id: String, dryRun: Bool, yes: Bool)
     case briefing(
         days: Int,
         maxOverdue: Int,
@@ -171,7 +199,10 @@ public enum CLIParser {
     }
 
     private static func isBooleanFlag(_ name: String) -> Bool {
-        ["all-day", "dry-run", "completed", "all", "include-notes"].contains(name)
+        [
+            "all-day", "no-all-day", "dry-run", "completed", "all", "include-notes",
+            "clear-location", "clear-notes", "clear-url", "clear-alarms", "clear-due", "yes"
+        ].contains(name)
     }
 
     private static func parseCommand(positionals: [String], flagPairs: [(name: String, value: String?)]) throws -> ParsedCommand {
@@ -222,13 +253,13 @@ public enum CLIParser {
 
         case "cal":
             guard positionals.count >= 2 else {
-                throw DaykitError(code: "MISSING_SUBCOMMAND", exitCode: .usageError, message: "Missing subcommand for 'cal'. Use calendars, today, week, list, or add.")
+                throw DaykitError(code: "MISSING_SUBCOMMAND", exitCode: .usageError, message: "Missing subcommand for 'cal'. Use calendars, today, week, list, add, update, or delete.")
             }
             return try parseCalCommand(sub: positionals[1], extraPositionals: Array(positionals.dropFirst(2)), flagPairs: flagPairs)
 
         case "rem":
             guard positionals.count >= 2 else {
-                throw DaykitError(code: "MISSING_SUBCOMMAND", exitCode: .usageError, message: "Missing subcommand for 'rem'. Use lists, list, overdue, today, add, or done.")
+                throw DaykitError(code: "MISSING_SUBCOMMAND", exitCode: .usageError, message: "Missing subcommand for 'rem'. Use lists, list, overdue, today, add, update, done, or delete.")
             }
             return try parseRemCommand(sub: positionals[1], extraPositionals: Array(positionals.dropFirst(2)), flagPairs: flagPairs)
 
@@ -293,6 +324,66 @@ public enum CLIParser {
                 dryRun: opts.bool("dry-run")
             )
 
+        case "update":
+            let opts = try OptionBag(
+                flagPairs,
+                allowed: [
+                    "id", "title", "start", "end", "duration", "all-day", "no-all-day",
+                    "calendar", "location", "clear-location", "notes", "clear-notes",
+                    "url", "clear-url", "alarm", "clear-alarms", "span", "dry-run", "yes"
+                ]
+            )
+            let id = try opts.singleRequired("id")
+            let title = try opts.singleNonEmptyOptional("title")
+            let start = try opts.singleOptional("start")
+            let end = try opts.singleOptional("end")
+            let duration = try opts.singleOptional("duration")
+            if end != nil && duration != nil {
+                throw DaykitError(code: "CONFLICTING_FLAGS", exitCode: .usageError, message: "Cannot specify both --end and --duration.")
+            }
+            let setAllDay = opts.bool("all-day")
+            let clearAllDay = opts.bool("no-all-day")
+            if setAllDay && clearAllDay {
+                throw DaykitError(code: "CONFLICTING_FLAGS", exitCode: .usageError, message: "Cannot specify both --all-day and --no-all-day.")
+            }
+            let allDay: Bool? = setAllDay ? true : (clearAllDay ? false : nil)
+            let calendarRef = try opts.singleOptional("calendar")
+            let locationPatch = try opts.singlePatch("location", clearFlag: "clear-location")
+            let notesPatch = try opts.singlePatch("notes", clearFlag: "clear-notes")
+            let urlPatch = try opts.singlePatch("url", clearFlag: "clear-url")
+            let alarmsPatch = try opts.manyPatch("alarm", clearFlag: "clear-alarms")
+            let span = try parseSpan(opts)
+
+            let hasAnyChange = title != nil || start != nil || end != nil || duration != nil || allDay != nil ||
+                calendarRef != nil || locationPatch.isMutating || notesPatch.isMutating ||
+                urlPatch.isMutating || alarmsPatch.isMutating
+            guard hasAnyChange else {
+                throw DaykitError(code: "NO_CHANGES", exitCode: .usageError, message: "No update fields specified for 'cal update'.")
+            }
+
+            return .calUpdate(
+                id: id,
+                title: title,
+                start: start,
+                end: end,
+                duration: duration,
+                allDay: allDay,
+                calendarRef: calendarRef,
+                location: locationPatch,
+                notes: notesPatch,
+                url: urlPatch,
+                alarms: alarmsPatch,
+                span: span,
+                dryRun: opts.bool("dry-run"),
+                yes: opts.bool("yes")
+            )
+
+        case "delete":
+            let opts = try OptionBag(flagPairs, allowed: ["id", "span", "dry-run", "yes"])
+            let id = try opts.singleRequired("id")
+            let span = try parseSpan(opts)
+            return .calDelete(id: id, span: span, dryRun: opts.bool("dry-run"), yes: opts.bool("yes"))
+
         default:
             throw DaykitError(code: "UNKNOWN_SUBCOMMAND", exitCode: .usageError, message: "Unknown 'cal' subcommand '\(sub)'.")
         }
@@ -345,14 +436,68 @@ public enum CLIParser {
                 dryRun: opts.bool("dry-run")
             )
 
+        case "update":
+            let opts = try OptionBag(
+                flagPairs,
+                allowed: [
+                    "id", "title", "list", "due", "clear-due", "priority",
+                    "notes", "clear-notes", "url", "clear-url", "dry-run"
+                ]
+            )
+            let id = try opts.singleRequired("id")
+            let title = try opts.singleNonEmptyOptional("title")
+            let listRef = try opts.singleOptional("list")
+            let duePatch = try opts.singlePatch("due", clearFlag: "clear-due")
+            let priority: PriorityLevel?
+            if let priorityStr = try opts.singleOptional("priority") {
+                guard let parsed = PriorityLevel(rawValue: priorityStr.lowercased()) else {
+                    throw DaykitError(code: "INVALID_ARGUMENT", exitCode: .usageError, message: "Invalid --priority '\(priorityStr)'. Use none, low, medium, or high.")
+                }
+                priority = parsed
+            } else {
+                priority = nil
+            }
+            let notesPatch = try opts.singlePatch("notes", clearFlag: "clear-notes")
+            let urlPatch = try opts.singlePatch("url", clearFlag: "clear-url")
+
+            let hasAnyChange = title != nil || listRef != nil || duePatch.isMutating ||
+                priority != nil || notesPatch.isMutating || urlPatch.isMutating
+            guard hasAnyChange else {
+                throw DaykitError(code: "NO_CHANGES", exitCode: .usageError, message: "No update fields specified for 'rem update'.")
+            }
+
+            return .remUpdate(
+                id: id,
+                title: title,
+                listRef: listRef,
+                due: duePatch,
+                priority: priority,
+                notes: notesPatch,
+                url: urlPatch,
+                dryRun: opts.bool("dry-run")
+            )
+
         case "done":
             let opts = try OptionBag(flagPairs, allowed: ["id", "dry-run"])
             let id = try opts.singleRequired("id")
             return .remDone(id: id, dryRun: opts.bool("dry-run"))
 
+        case "delete":
+            let opts = try OptionBag(flagPairs, allowed: ["id", "dry-run", "yes"])
+            let id = try opts.singleRequired("id")
+            return .remDelete(id: id, dryRun: opts.bool("dry-run"), yes: opts.bool("yes"))
+
         default:
             throw DaykitError(code: "UNKNOWN_SUBCOMMAND", exitCode: .usageError, message: "Unknown 'rem' subcommand '\(sub)'.")
         }
+    }
+
+    private static func parseSpan(_ opts: OptionBag) throws -> EventSpan? {
+        guard let raw = try opts.singleOptional("span") else { return nil }
+        guard let span = EventSpan(rawValue: raw.lowercased()) else {
+            throw DaykitError(code: "INVALID_ARGUMENT", exitCode: .usageError, message: "Invalid --span '\(raw)'. Use this or future.")
+        }
+        return span
     }
 }
 
@@ -378,8 +523,7 @@ private struct OptionBag {
     }
 
     func bool(_ name: String) -> Bool {
-        if bools.contains(name) { return true }
-        return false
+        bools.contains(name)
     }
 
     func many(_ name: String) -> [String] {
@@ -394,11 +538,41 @@ private struct OptionBag {
         return list.first
     }
 
+    func singleNonEmptyOptional(_ name: String) throws -> String? {
+        guard let value = try singleOptional(name) else { return nil }
+        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw DaykitError(code: "INVALID_ARGUMENT", exitCode: .usageError, message: "Flag --\(name) cannot be empty.")
+        }
+        return value
+    }
+
     func singleRequired(_ name: String) throws -> String {
         guard let value = try singleOptional(name), !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DaykitError(code: "MISSING_FLAG", exitCode: .usageError, message: "Missing required flag --\(name).")
         }
         return value
+    }
+
+    func singlePatch(_ name: String, clearFlag: String) throws -> FieldPatch<String> {
+        let val = try singleOptional(name)
+        let shouldClear = bool(clearFlag)
+        if val != nil && shouldClear {
+            throw DaykitError(code: "CONFLICTING_FLAGS", exitCode: .usageError, message: "Cannot specify both --\(name) and --\(clearFlag).")
+        }
+        if shouldClear { return .clear }
+        if let val { return .set(val) }
+        return .unchanged
+    }
+
+    func manyPatch(_ name: String, clearFlag: String) throws -> FieldPatch<[String]> {
+        let vals = many(name)
+        let shouldClear = bool(clearFlag)
+        if !vals.isEmpty && shouldClear {
+            throw DaykitError(code: "CONFLICTING_FLAGS", exitCode: .usageError, message: "Cannot specify both --\(name) and --\(clearFlag).")
+        }
+        if shouldClear { return .clear }
+        if !vals.isEmpty { return .set(vals) }
+        return .unchanged
     }
 
     func intOptional(_ name: String, default defaultValue: Int) throws -> Int {

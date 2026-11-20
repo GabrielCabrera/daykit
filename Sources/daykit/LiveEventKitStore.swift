@@ -143,6 +143,15 @@ public final class LiveEventKitStore: EventStoreProtocol, @unchecked Sendable {
         }
     }
 
+    public func findEvent(instanceId: String) async throws -> EventRecord? {
+        try await runOnQueue { store in
+            guard let event = try Self.resolveEKEventOnQueue(store: store, instanceId: instanceId) else {
+                return nil
+            }
+            return Self.mapEvent(event, calendar: Calendar.current, defaultTimeZone: TimeZone.current)
+        }
+    }
+
     public func createEvent(_ input: EventCreateInput) async throws -> EventRecord {
         try await runOnQueue { store in
             guard let targetCalendar = store.calendars(for: .event).first(where: { $0.calendarIdentifier == input.calendarId }) else {
@@ -172,6 +181,96 @@ public final class LiveEventKitStore: EventStoreProtocol, @unchecked Sendable {
 
             try store.save(event, span: .thisEvent, commit: true)
             return Self.mapEvent(event, calendar: Calendar.current, defaultTimeZone: TimeZone.current)
+        }
+    }
+
+    public func updateEvent(_ input: EventUpdateInput) async throws -> EventRecord {
+        try await runOnQueue { store in
+            guard let event = try Self.resolveEKEventOnQueue(store: store, instanceId: input.instanceId) else {
+                throw DaykitError(code: "EVENT_NOT_FOUND", exitCode: .notFound, message: "Event '\(input.instanceId)' not found.")
+            }
+            guard event.calendar?.allowsContentModifications == true else {
+                throw DaykitError(code: "CALENDAR_READ_ONLY", exitCode: .permissionOrPolicyDenied, message: "Event calendar is read-only.")
+            }
+
+            if let destinationCalendarId = input.calendarId {
+                guard let destCal = store.calendars(for: .event).first(where: { $0.calendarIdentifier == destinationCalendarId }) else {
+                    throw DaykitError(code: "CALENDAR_NOT_FOUND", exitCode: .notFound, message: "Calendar '\(destinationCalendarId)' not found.")
+                }
+                guard destCal.allowsContentModifications else {
+                    throw DaykitError(code: "CALENDAR_READ_ONLY", exitCode: .permissionOrPolicyDenied, message: "Calendar '\(destCal.title)' is read-only.")
+                }
+                event.calendar = destCal
+            }
+
+            if let title = input.title {
+                event.title = title
+            }
+            if let allDay = input.allDay {
+                event.isAllDay = allDay
+            }
+            if let startDate = input.startDate {
+                event.startDate = startDate
+            }
+            if let endDate = input.endDate {
+                event.endDate = endDate
+            }
+            if !event.isAllDay && event.timeZone == nil {
+                event.timeZone = TimeZone.current
+            }
+
+            switch input.location {
+            case .unchanged: break
+            case .clear: event.location = nil
+            case .set(let val): event.location = val.isEmpty ? nil : val
+            }
+
+            switch input.notes {
+            case .unchanged: break
+            case .clear: event.notes = nil
+            case .set(let val): event.notes = val.isEmpty ? nil : val
+            }
+
+            switch input.url {
+            case .unchanged: break
+            case .clear: event.url = nil
+            case .set(let val): event.url = URL(string: val)
+            }
+
+            switch input.alarmsMinutesBefore {
+            case .unchanged:
+                break
+            case .clear:
+                for alarm in (event.alarms ?? []) {
+                    event.removeAlarm(alarm)
+                }
+            case .set(let mins):
+                for alarm in (event.alarms ?? []) {
+                    event.removeAlarm(alarm)
+                }
+                for m in mins {
+                    event.addAlarm(EKAlarm(relativeOffset: TimeInterval(-m * 60)))
+                }
+            }
+
+            let ekSpan: EKSpan = (input.span == .future) ? .futureEvents : .thisEvent
+            try store.save(event, span: ekSpan, commit: true)
+            return Self.mapEvent(event, calendar: Calendar.current, defaultTimeZone: TimeZone.current)
+        }
+    }
+
+    public func deleteEvent(instanceId: String, span: EventSpan) async throws -> EventRecord {
+        try await runOnQueue { store in
+            guard let event = try Self.resolveEKEventOnQueue(store: store, instanceId: instanceId) else {
+                throw DaykitError(code: "EVENT_NOT_FOUND", exitCode: .notFound, message: "Event '\(instanceId)' not found.")
+            }
+            guard event.calendar?.allowsContentModifications == true else {
+                throw DaykitError(code: "CALENDAR_READ_ONLY", exitCode: .permissionOrPolicyDenied, message: "Event calendar is read-only.")
+            }
+            let snapshot = Self.mapEvent(event, calendar: Calendar.current, defaultTimeZone: TimeZone.current)
+            let ekSpan: EKSpan = (span == .future) ? .futureEvents : .thisEvent
+            try store.remove(event, span: ekSpan, commit: true)
+            return snapshot
         }
     }
 
@@ -287,6 +386,63 @@ public final class LiveEventKitStore: EventStoreProtocol, @unchecked Sendable {
         }
     }
 
+    public func updateReminder(_ input: ReminderUpdateInput) async throws -> ReminderRecord {
+        try await runOnQueue { store in
+            guard let reminder = store.calendarItem(withIdentifier: input.id) as? EKReminder else {
+                throw DaykitError(code: "REMINDER_NOT_FOUND", exitCode: .notFound, message: "Reminder '\(input.id)' not found.")
+            }
+            guard reminder.calendar?.allowsContentModifications == true else {
+                throw DaykitError(code: "LIST_READ_ONLY", exitCode: .permissionOrPolicyDenied, message: "Reminder list is read-only.")
+            }
+
+            if let destListId = input.listId {
+                guard let destList = store.calendars(for: .reminder).first(where: { $0.calendarIdentifier == destListId }) else {
+                    throw DaykitError(code: "LIST_NOT_FOUND", exitCode: .notFound, message: "Reminder list '\(destListId)' not found.")
+                }
+                guard destList.allowsContentModifications else {
+                    throw DaykitError(code: "LIST_READ_ONLY", exitCode: .permissionOrPolicyDenied, message: "Reminder list '\(destList.title)' is read-only.")
+                }
+                reminder.calendar = destList
+            }
+
+            if let title = input.title {
+                reminder.title = title
+            }
+            if let priority = input.priority {
+                reminder.priority = priority.eventKitValue
+            }
+
+            switch input.due {
+            case .unchanged:
+                break
+            case .clear:
+                reminder.dueDateComponents = nil
+                Self.removeAbsoluteAlarms(from: reminder)
+            case .set(let dueUpdate):
+                reminder.dueDateComponents = dueUpdate.dueComponents
+                Self.removeAbsoluteAlarms(from: reminder)
+                if let alarmDate = dueUpdate.dueAlarmDate {
+                    reminder.addAlarm(EKAlarm(absoluteDate: alarmDate))
+                }
+            }
+
+            switch input.notes {
+            case .unchanged: break
+            case .clear: reminder.notes = nil
+            case .set(let val): reminder.notes = val.isEmpty ? nil : val
+            }
+
+            switch input.url {
+            case .unchanged: break
+            case .clear: reminder.url = nil
+            case .set(let val): reminder.url = URL(string: val)
+            }
+
+            try store.save(reminder, commit: true)
+            return Self.mapReminder(reminder, timeZone: TimeZone.current)
+        }
+    }
+
     public func completeReminder(id: String) async throws -> CompleteReminderResult {
         let initial: (result: CompleteReminderResult?, listId: String, title: String, isRecurring: Bool) = try await runOnQueue { store in
             guard let reminder = store.calendarItem(withIdentifier: id) as? EKReminder else {
@@ -365,6 +521,20 @@ public final class LiveEventKitStore: EventStoreProtocol, @unchecked Sendable {
         )
     }
 
+    public func deleteReminder(id: String) async throws -> ReminderRecord {
+        try await runOnQueue { store in
+            guard let reminder = store.calendarItem(withIdentifier: id) as? EKReminder else {
+                throw DaykitError(code: "REMINDER_NOT_FOUND", exitCode: .notFound, message: "Reminder '\(id)' not found.")
+            }
+            guard reminder.calendar?.allowsContentModifications == true else {
+                throw DaykitError(code: "LIST_READ_ONLY", exitCode: .permissionOrPolicyDenied, message: "Reminder list is read-only.")
+            }
+            let snapshot = Self.mapReminder(reminder, timeZone: TimeZone.current)
+            try store.remove(reminder, commit: true)
+            return snapshot
+        }
+    }
+
     public func listSources(eventsAuthorized: Bool, remindersAuthorized: Bool) async throws -> [String] {
         guard eventsAuthorized || remindersAuthorized else { return [] }
         return try await runOnQueue { store in
@@ -425,6 +595,44 @@ public final class LiveEventKitStore: EventStoreProtocol, @unchecked Sendable {
                 timer.cancel()
                 gate.finish(with: result)
             }
+        }
+    }
+
+    private static func resolveEKEventOnQueue(store: EKEventStore, instanceId: String) throws -> EKEvent? {
+        let ref = EventInstanceRef.parse(instanceId)
+        if let occDate = ref.occurrenceDate {
+            for windowSeconds: TimeInterval in [86400, 604800] {
+                let start = occDate.addingTimeInterval(-windowSeconds)
+                let end = occDate.addingTimeInterval(windowSeconds)
+                let predicate = store.predicateForEvents(withStart: start, end: end, calendars: nil)
+                let candidates = store.events(matching: predicate)
+                if let matched = candidates.first(where: { event in
+                    let sameSeries = (event.eventIdentifier == ref.seriesId) || (event.calendarItemIdentifier == ref.seriesId)
+                    guard sameSeries else { return false }
+                    guard let anchor = event.occurrenceDate ?? event.startDate else { return false }
+                    return abs(anchor.timeIntervalSince(occDate)) <= 1.0
+                }) {
+                    return matched
+                }
+            }
+            return nil
+        }
+
+        let found = store.event(withIdentifier: ref.seriesId) ?? (store.calendarItem(withIdentifier: ref.seriesId) as? EKEvent)
+        guard let event = found else { return nil }
+        if event.hasRecurrenceRules || event.isDetached {
+            throw DaykitError(
+                code: "AMBIGUOUS_RECURRING_ID",
+                exitCode: .usageError,
+                message: "Event '\(ref.seriesId)' is recurring/detached; use the full instance_id (<series_id>@<occurrence_utc>) from 'cal list/today/week'."
+            )
+        }
+        return event
+    }
+
+    private static func removeAbsoluteAlarms(from reminder: EKReminder) {
+        for alarm in (reminder.alarms ?? []) where alarm.absoluteDate != nil {
+            reminder.removeAlarm(alarm)
         }
     }
 
@@ -590,7 +798,7 @@ public final class LiveEventKitStore: EventStoreProtocol, @unchecked Sendable {
         case .tentative: return "tentative"
         case .delegated: return "delegated"
         case .completed: return "completed"
-        case .inProcess: return "in_process"
+        case .inProcess: return "in_progress"
         @unknown default: return "unknown"
         }
     }
