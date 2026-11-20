@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Swift toolchain
+        run: swift --version
+
+      - name: Verify Info.plist and Version parity
+        run: |
+          PLIST_VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          PLIST_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist)"
+          SWIFT_VER="$(sed -n 's/.*public static let current = "\([^"]*\)".*/\1/p' Sources/DaykitCore/Domain.swift)"
+          echo "PLIST=$PLIST_VER ($PLIST_BUILD) SWIFT=$SWIFT_VER"
+          test -n "$SWIFT_VER"
+          test "$PLIST_VER" = "$SWIFT_VER"
+          test "$PLIST_BUILD" = "$SWIFT_VER"
+
+      - name: Build release binary
+        run: swift build -c release
+
+      - name: Run unit test suite
+        run: swift test
+
+      - name: Verify embedded Info.plist
+        run: |
+          BIN="$(swift build -c release --show-bin-path)/daykit"
+          otool -P "$BIN" | grep -q 'dev.gabrielcabrera.daykit'
+          otool -P "$BIN" | grep -q 'NSCalendarsFullAccessUsageDescription'
+          otool -P "$BIN" | grep -q 'NSRemindersFullAccessUsageDescription'
+
+      - name: Smoke checks (no TCC prompt)
+        run: |
+          BIN="$(swift build -c release --show-bin-path)/daykit"
+          test "$("$BIN" --version)" = "0.1.0"
+          "$BIN" --help >/dev/null
+          "$BIN" doctor | jq -e '.schema_version == 1 and .ok == true and .data.daykit_version == "0.1.0"'
