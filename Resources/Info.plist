@@ -9,9 +9,9 @@
     <key>CFBundleExecutable</key>
     <string>daykit</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.0</string>
+    <string>0.2.1</string>
     <key>CFBundleVersion</key>
-    <string>0.2.0</string>
+    <string>0.2.1</string>
     <key>NSCalendarsUsageDescription</key>
     <string>daykit needs access to your calendars to read, create, update, and delete calendar entries locally.</string>
     <key>NSRemindersUsageDescription</key>

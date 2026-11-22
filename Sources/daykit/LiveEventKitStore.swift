@@ -176,7 +176,7 @@ public final class LiveEventKitStore: EventStoreProtocol, @unchecked Sendable {
                 event.timeZone = TimeZone.current
             }
             for minutes in input.alarmsMinutesBefore {
-                event.addAlarm(EKAlarm(relativeOffset: TimeInterval(-minutes * 60)))
+                event.addAlarm(EKAlarm(relativeOffset: -TimeInterval(minutes) * 60.0))
             }
 
             try store.save(event, span: .thisEvent, commit: true)
@@ -249,7 +249,7 @@ public final class LiveEventKitStore: EventStoreProtocol, @unchecked Sendable {
                     event.removeAlarm(alarm)
                 }
                 for m in mins {
-                    event.addAlarm(EKAlarm(relativeOffset: TimeInterval(-m * 60)))
+                    event.addAlarm(EKAlarm(relativeOffset: -TimeInterval(m) * 60.0))
                 }
             }
 

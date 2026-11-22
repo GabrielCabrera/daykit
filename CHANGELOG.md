@@ -2,6 +2,16 @@
 
 All notable changes to `daykit` are documented in this file.
 
+## [0.2.1] - 2026-11-22
+
+### Security & Hardening
+- **Fail-Closed Boolean Flags (`CLIParser`):** Reject `--<bool-flag>=<value>` forms (including `--dry-run=true`, `--yes=true`, `--all-day=true`, and `--json=true`) with `INVALID_ARGUMENT` (exit `2`) instead of silently evaluating them as `false`.
+- **Fail-Closed Empty Allowlists (`Domain`, `DaykitApp`):** Distinguish unset `DAYKIT_WRITABLE_CALENDARS` / `DAYKIT_WRITABLE_LISTS` from explicitly empty values (`""` or `" , "`), blocking all mutations (`POLICY_DENIED`, exit `3`) when configured with zero permitted targets.
+- **Symlink & FIFO Audit Log Guards (`AuditLogger`):** Validate parent directories with `lstat` (`S_ISDIR`), open audit logs with `O_NOFOLLOW | O_NONBLOCK`, and verify `fstat` (`S_ISREG` and `st_uid == getuid()`) before `fchmod`/`write`.
+- **Complete `--plain` Sanitization (`OutputFormatter`, `DaykitApp`):** Strip ANSI CSI/OSC and ASCII control characters across `briefing` calendar titles, `doctor` source names/policy/notes, `cal add`/`rem add`/`rem done` lines, and `--plain` error output.
+- **Overflow-Safe Duration & Alarm Arithmetic (`DateParsing`, `LiveEventKitStore`):** Enforce checked multiplication/addition (`maxDurationSeconds` 10-year cap) in `parseDuration` and overflow-free `TimeInterval` scaling for event alarms.
+- **CI/CD Hardening (`.github/workflows/`):** Add explicit `permissions: contents: read` in `ci.yml`, pin `actions/checkout` by commit SHA, resolve `refs/tags/${TAG}` explicitly in `git archive`, and disallow `--clobber` overwrites on published releases.
+
 ## [0.2.0] - 2026-11-20
 
 ### Added

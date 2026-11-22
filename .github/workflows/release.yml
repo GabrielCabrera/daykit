@@ -13,7 +13,7 @@ jobs:
     name: Release (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -50,7 +50,7 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           VER="${TAG#v}"
           mkdir -p dist
-          git archive --format=tar.gz --prefix="daykit-${VER}/" -o "dist/daykit-${TAG}-source.tar.gz" "$TAG"
+          git archive --format=tar.gz --prefix="daykit-${VER}/" -o "dist/daykit-${TAG}-source.tar.gz" "refs/tags/${TAG}"
           (cd dist && shasum -a 256 "daykit-${TAG}-source.tar.gz" > SHA256SUMS && cat SHA256SUMS)
 
       - name: Publish GitHub Release
@@ -59,14 +59,12 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
-              "dist/daykit-${TAG}-source.tar.gz" "dist/SHA256SUMS" \
-              --clobber --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$TAG" \
-              "dist/daykit-${TAG}-source.tar.gz" "dist/SHA256SUMS" \
-              --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
-              --title "$TAG" \
-              --generate-notes
+            echo "Error: release $TAG already exists; refusing to overwrite existing artifacts." >&2
+            exit 1
           fi
+          gh release create "$TAG" \
+            "dist/daykit-${TAG}-source.tar.gz" "dist/SHA256SUMS" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$TAG" \
+            --generate-notes

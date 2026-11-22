@@ -129,6 +129,8 @@ public enum DateParsing {
         return base
     }
 
+    public static let maxDurationSeconds: Int = 365 * 10 * 86_400
+
     public static func parseDuration(_ raw: String) throws -> TimeInterval {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !trimmed.isEmpty else {
@@ -136,7 +138,7 @@ public enum DateParsing {
         }
 
         var index = trimmed.startIndex
-        var totalSeconds: TimeInterval = 0
+        var totalSeconds = 0
         var parsedTokens = 0
 
         while index < trimmed.endIndex {
@@ -152,17 +154,18 @@ public enum DateParsing {
                 )
             }
             guard let amount = Int(trimmed[numStart..<index]), amount >= 0 else {
-                throw DaykitError(code: "INVALID_DURATION", exitCode: .usageError, message: "Invalid duration number in '\(raw)'.")
+                throw DaykitError(code: "INVALID_DURATION", exitCode: .usageError, message: "Duration exceeds supported numeric range in '\(raw)'.")
             }
 
             let unit = trimmed[index]
             index = trimmed.index(after: index)
             parsedTokens += 1
 
+            let multiplier: Int
             switch unit {
-            case "m": totalSeconds += TimeInterval(amount * 60)
-            case "h": totalSeconds += TimeInterval(amount * 3600)
-            case "d": totalSeconds += TimeInterval(amount * 86400)
+            case "m": multiplier = 60
+            case "h": multiplier = 3600
+            case "d": multiplier = 86400
             default:
                 throw DaykitError(
                     code: "INVALID_DURATION",
@@ -170,6 +173,17 @@ public enum DateParsing {
                     message: "Unsupported duration unit '\(unit)' in '\(raw)'. Use m, h, or d."
                 )
             }
+
+            let (tokenSeconds, mulOverflow) = amount.multipliedReportingOverflow(by: multiplier)
+            let (updatedTotal, addOverflow) = totalSeconds.addingReportingOverflow(tokenSeconds)
+            guard !mulOverflow, !addOverflow, updatedTotal <= maxDurationSeconds else {
+                throw DaykitError(
+                    code: "INVALID_DURATION",
+                    exitCode: .usageError,
+                    message: "Duration exceeds maximum supported range (10 years) in '\(raw)'."
+                )
+            }
+            totalSeconds = updatedTotal
         }
 
         guard parsedTokens > 0, totalSeconds > 0 else {
@@ -179,7 +193,7 @@ public enum DateParsing {
                 message: "Duration must be greater than zero: '\(raw)'."
             )
         }
-        return totalSeconds
+        return TimeInterval(totalSeconds)
     }
 
     public static func validateHTTPSURL(_ raw: String) throws -> String {

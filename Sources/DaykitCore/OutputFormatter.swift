@@ -243,29 +243,35 @@ public enum OutputFormatting {
         lines.append("\nToday reminders (\(payload.todayReminders.count)):")
         lines.append(contentsOf: payload.todayReminders.isEmpty ? ["  (none)"] : payload.todayReminders.map { "  - \(stripControlAndANSI($0.title)) (\($0.dueAt ?? ""))  id=\($0.id)" })
         lines.append("\nToday events (\(payload.todayEvents.count)):")
-        lines.append(contentsOf: payload.todayEvents.isEmpty ? ["  (none)"] : payload.todayEvents.map { "  - \($0.startAt) \(stripControlAndANSI($0.title)) [\($0.calendarTitle)]" })
+        lines.append(contentsOf: payload.todayEvents.isEmpty ? ["  (none)"] : payload.todayEvents.map { "  - \($0.startAt) \(stripControlAndANSI($0.title)) [\(stripControlAndANSI($0.calendarTitle))]" })
         if payload.days > 1 {
             lines.append("\nUpcoming events (\(payload.upcomingEvents.count)):")
-            lines.append(contentsOf: payload.upcomingEvents.isEmpty ? ["  (none)"] : payload.upcomingEvents.map { "  - \($0.startAt) \(stripControlAndANSI($0.title)) [\($0.calendarTitle)]" })
+            lines.append(contentsOf: payload.upcomingEvents.isEmpty ? ["  (none)"] : payload.upcomingEvents.map { "  - \($0.startAt) \(stripControlAndANSI($0.title)) [\(stripControlAndANSI($0.calendarTitle))]" })
         }
         return lines.joined(separator: "\n") + "\n"
     }
 
     public static func renderPlainDoctor(_ doctor: DoctorPayload) -> String {
+        let calPolicy = doctor.policy.writableCalendarsRestricted && doctor.policy.writableCalendars.isEmpty
+            ? "(none-blocked)"
+            : doctor.policy.writableCalendars.map(stripControlAndANSI).joined(separator: ",")
+        let listPolicy = doctor.policy.writableListsRestricted && doctor.policy.writableLists.isEmpty
+            ? "(none-blocked)"
+            : doctor.policy.writableLists.map(stripControlAndANSI).joined(separator: ",")
         var lines: [String] = [
             "daykit \(doctor.daykitVersion) (\(doctor.arch), macOS \(doctor.macosVersion))",
             "Session: ssh=\(doctor.session.isSSH), aqua_gui=\(doctor.session.hasAquaGUI)",
             "Permissions: calendars=\(doctor.permissions.calendars.rawValue), reminders=\(doctor.permissions.reminders.rawValue)",
-            "Policy: read_only=\(doctor.policy.readOnly), writable_calendars=\(doctor.policy.writableCalendars.joined(separator: ",")), writable_lists=\(doctor.policy.writableLists.joined(separator: ",")), audit_log_enabled=\(doctor.policy.auditLogEnabled)"
+            "Policy: read_only=\(doctor.policy.readOnly), writable_calendars=\(calPolicy), writable_lists=\(listPolicy), audit_log_enabled=\(doctor.policy.auditLogEnabled)"
         ]
         if let auditPath = doctor.policy.auditLogPath {
-            lines.append("Audit log: \(auditPath)")
+            lines.append("Audit log: \(stripControlAndANSI(auditPath))")
         }
         if let defCal = doctor.defaultCalendar {
-            lines.append("Default calendar: \(stripControlAndANSI(defCal.title)) [\(defCal.sourceName)] (\(defCal.id))")
+            lines.append("Default calendar: \(stripControlAndANSI(defCal.title)) [\(stripControlAndANSI(defCal.sourceName))] (\(defCal.id))")
         }
         if let defList = doctor.defaultReminderList {
-            lines.append("Default reminder list: \(stripControlAndANSI(defList.title)) [\(defList.sourceName)] (\(defList.id))")
+            lines.append("Default reminder list: \(stripControlAndANSI(defList.title)) [\(stripControlAndANSI(defList.sourceName))] (\(defList.id))")
         }
         if !doctor.sources.isEmpty {
             lines.append("Sources: " + doctor.sources.map(stripControlAndANSI).joined(separator: ", "))
@@ -273,7 +279,7 @@ public enum OutputFormatting {
         if !doctor.notes.isEmpty {
             lines.append("Notes:")
             for note in doctor.notes {
-                lines.append("  - \(note)")
+                lines.append("  - \(stripControlAndANSI(note))")
             }
         }
         return lines.joined(separator: "\n") + "\n"

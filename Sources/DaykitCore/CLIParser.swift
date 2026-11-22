@@ -135,6 +135,13 @@ public enum CLIParser {
                 if let eqIndex = rawFlag.firstIndex(of: "=") {
                     let name = String(rawFlag[..<eqIndex])
                     let value = String(rawFlag[rawFlag.index(after: eqIndex)...])
+                    if isBooleanFlag(name) || ["help", "version", "json", "plain"].contains(name) {
+                        throw DaykitError(
+                            code: "INVALID_ARGUMENT",
+                            exitCode: .usageError,
+                            message: "Boolean flag --\(name) does not accept a value (got '--\(name)=\(value)'). Pass --\(name) on its own."
+                        )
+                    }
                     flagPairs.append((name, value))
                     i += 1
                     continue
@@ -198,7 +205,7 @@ public enum CLIParser {
         return CLIInvocation(command: command, outputMode: outputMode)
     }
 
-    private static func isBooleanFlag(_ name: String) -> Bool {
+    fileprivate static func isBooleanFlag(_ name: String) -> Bool {
         [
             "all-day", "no-all-day", "dry-run", "completed", "all", "include-notes",
             "clear-location", "clear-notes", "clear-url", "clear-alarms", "clear-due", "yes"
@@ -515,6 +522,13 @@ private struct OptionBag {
                 )
             }
             if let value {
+                if CLIParser.isBooleanFlag(name) {
+                    throw DaykitError(
+                        code: "INVALID_ARGUMENT",
+                        exitCode: .usageError,
+                        message: "Boolean flag --\(name) does not accept a value (got '--\(name)=\(value)'). Pass --\(name) on its own."
+                    )
+                }
                 values[name, default: []].append(value)
             } else {
                 bools.insert(name)

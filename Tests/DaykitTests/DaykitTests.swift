@@ -1,3 +1,4 @@
+import Darwin
 @testable import DaykitCore
 import Foundation
 import Testing
@@ -455,5 +456,155 @@ struct DaykitTests {
         let sshReq = await app.run(arguments: ["rem", "overdue"])
         #expect(sshReq.exitCode == .permissionOrPolicyDenied)
         #expect(store.requestAccessCalls.isEmpty)
+    }
+
+    // MARK: - Security & Hardening Tests (v0.2.1)
+
+    @Test("Boolean flags with =value fail closed and execute zero mutations")
+    func booleanFlagsWithEqualsFailClosed() async throws {
+        let store = MockEventStore()
+        store.calendars = [
+            CalendarSummary(id: "cal-1", title: "Personal", sourceName: "iCloud", sourceType: "icloud", colorHex: nil, writable: true, isDefault: true, isSubscribed: false, isImmutable: false)
+        ]
+        store.reminderLists = [
+            ReminderListSummary(id: "list-1", title: "Inbox", sourceName: "iCloud", sourceType: "icloud", colorHex: nil, writable: true, isDefault: true)
+        ]
+        store.events = [
+            EventRecord(instanceId: "ev-1@2026-11-20T14:00:00Z", seriesId: "ev-1", title: "Existing", startAt: "2026-11-20T11:00:00-03:00", endAt: "2026-11-20T12:00:00-03:00", allDay: false, timezone: nil, calendarId: "cal-1", calendarTitle: "Personal", location: nil, notes: nil, hasNotes: false, notesTruncated: false, url: nil, availability: "busy", status: "confirmed", isRecurring: false, isDetached: false, occurrenceDate: nil, alarmsMinutesBefore: [], attendees: [])
+        ]
+        store.reminders = [
+            ReminderRecord(id: "rem-1", title: "Existing Rem", listId: "list-1", listTitle: "Inbox", dueAt: nil, hasDueTime: false, completed: false, completionDate: nil, priority: .none, notes: nil, hasNotes: false, notesTruncated: false, url: nil, isRecurring: false, createdAt: nil, modifiedAt: nil)
+        ]
+
+        let app = makeApp(store: store)
+        for badArgs in [
+            ["rem", "add", "--title", "ShouldFail", "--dry-run=true"],
+            ["rem", "delete", "--id", "rem-1", "--yes=true"],
+            ["cal", "add", "--title", "ShouldFail", "--start", "2026-11-20T15:00:00-03:00", "--all-day=true"],
+            ["briefing", "--json=true"]
+        ] {
+            let out = await app.run(arguments: badArgs)
+            #expect(out.exitCode == .usageError)
+        }
+        #expect(store.createdReminderInputs.isEmpty)
+        #expect(store.deletedReminderIDs.isEmpty)
+        #expect(store.createdEventInputs.isEmpty)
+    }
+
+    @Test("Explicitly empty writable allowlists fail closed while unset vars allow writable targets")
+    func emptyAllowlistFailsClosed() async throws {
+        let unsetPolicy = RuntimePolicy.fromEnvironment([:])
+        #expect(!unsetPolicy.writableCalendarsRestricted)
+        #expect(!unsetPolicy.writableListsRestricted)
+
+        let emptyPolicy = RuntimePolicy.fromEnvironment([
+            "DAYKIT_WRITABLE_CALENDARS": "",
+            "DAYKIT_WRITABLE_LISTS": " , "
+        ])
+        #expect(emptyPolicy.writableCalendarsRestricted)
+        #expect(emptyPolicy.writableListsRestricted)
+        #expect(emptyPolicy.writableCalendars.isEmpty)
+        #expect(emptyPolicy.writableLists.isEmpty)
+
+        let store = MockEventStore()
+        store.calendars = [
+            CalendarSummary(id: "cal-1", title: "Personal", sourceName: "iCloud", sourceType: "icloud", colorHex: nil, writable: true, isDefault: true, isSubscribed: false, isImmutable: false)
+        ]
+        store.reminderLists = [
+            ReminderListSummary(id: "list-1", title: "Inbox", sourceName: "iCloud", sourceType: "icloud", colorHex: nil, writable: true, isDefault: true)
+        ]
+
+        let app = makeApp(store: store, policy: emptyPolicy)
+        let calOut = await app.run(arguments: ["cal", "add", "--title", "Blocked", "--start", "2026-11-21T10:00:00-03:00"])
+        #expect(calOut.exitCode == .permissionOrPolicyDenied)
+        #expect(try decodeJSON(calOut.stderr)["error"].flatMap { $0 as? [String: Any] }?["code"] as? String == "POLICY_DENIED")
+
+        let remOut = await app.run(arguments: ["rem", "add", "--title", "Blocked"])
+        #expect(remOut.exitCode == .permissionOrPolicyDenied)
+        #expect(try decodeJSON(remOut.stderr)["error"].flatMap { $0 as? [String: Any] }?["code"] as? String == "POLICY_DENIED")
+        #expect(store.createdEventInputs.isEmpty)
+        #expect(store.createdReminderInputs.isEmpty)
+    }
+
+    @Test("FileAuditLogWriter rejects symlinks and FIFOs cleanly")
+    func fileAuditLogWriterRejectsSymlinkAndFIFO() throws {
+        let baseDir = FileManager.default.temporaryDirectory.appendingPathComponent("daykit-audit-sec-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+
+        let targetFile = baseDir.appendingPathComponent("victim.txt")
+        try "UNTOUCHED\n".write(to: targetFile, atomically: true, encoding: .utf8)
+        let symlinkPath = baseDir.appendingPathComponent("audit-link.jsonl").path
+        try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: targetFile.path)
+
+        let entry = AuditEntry(timestamp: "2026-11-22T10:00:00-03:00", action: "delete_reminder", targetId: "r-1")
+        let linkWriter = FileAuditLogWriter(path: symlinkPath)
+        do {
+            try linkWriter.record(entry)
+            Issue.record("Expected FileAuditLogWriter to reject symlink")
+        } catch let err as DaykitError {
+            #expect(err.code == "AUDIT_LOG_ERROR")
+        }
+        #expect(try String(contentsOf: targetFile, encoding: .utf8) == "UNTOUCHED\n")
+
+        let fifoPath = baseDir.appendingPathComponent("audit-fifo.jsonl").path
+        #expect(Darwin.mkfifo(fifoPath, 0o600) == 0)
+        let fifoWriter = FileAuditLogWriter(path: fifoPath)
+        do {
+            try fifoWriter.record(entry)
+            Issue.record("Expected FileAuditLogWriter to reject FIFO")
+        } catch let err as DaykitError {
+            #expect(err.code == "AUDIT_LOG_ERROR")
+        }
+    }
+
+    @Test("--plain strips ANSI and control sequences across briefing, doctor, rem done, and errors")
+    func plainOutputSanitizesAllPaths() async throws {
+        let store = MockEventStore()
+        store.calendarsAuth = .fullAccess
+        store.remindersAuth = .fullAccess
+        store.calendars = [
+            CalendarSummary(id: "cal-1", title: "Cal\u{001B}[31mName", sourceName: "iCloud\u{001B}]0;x\u{0007}", sourceType: "icloud", colorHex: nil, writable: false, isDefault: true, isSubscribed: false, isImmutable: false)
+        ]
+        store.reminderLists = [
+            ReminderListSummary(id: "list-1", title: "Inbox\u{001B}[32mList", sourceName: "iCloud\u{001B}[0m", sourceType: "icloud", colorHex: nil, writable: true, isDefault: true)
+        ]
+        store.events = [
+            EventRecord(instanceId: "e-1@2026-11-20T14:00:00Z", seriesId: "e-1", title: "Event", startAt: "2026-11-20T11:00:00-03:00", endAt: "2026-11-20T12:00:00-03:00", allDay: false, timezone: nil, calendarId: "cal-1", calendarTitle: "Cal\u{001B}[31mName", location: nil, notes: nil, hasNotes: false, notesTruncated: false, url: nil, availability: "busy", status: "confirmed", isRecurring: false, isDetached: false, occurrenceDate: nil, alarmsMinutesBefore: [], attendees: [])
+        ]
+        store.reminders = [
+            ReminderRecord(id: "r-1", title: "Done\u{001B}[31mTitle", listId: "list-1", listTitle: "InboxList", dueAt: nil, hasDueTime: false, completed: false, completionDate: nil, priority: .none, notes: nil, hasNotes: false, notesTruncated: false, url: nil, isRecurring: false, createdAt: nil, modifiedAt: nil)
+        ]
+
+        let app = makeApp(store: store)
+        let briefingOut = await app.run(arguments: ["briefing", "--plain"])
+        #expect(briefingOut.exitCode == .success)
+        #expect(!briefingOut.stdout.contains("\u{001B}"))
+
+        let doctorOut = await app.run(arguments: ["doctor", "--plain"])
+        #expect(doctorOut.exitCode == .success)
+        #expect(!doctorOut.stdout.contains("\u{001B}"))
+
+        let doneOut = await app.run(arguments: ["rem", "done", "--id", "r-1", "--plain"])
+        #expect(doneOut.exitCode == .success)
+        #expect(!doneOut.stdout.contains("\u{001B}"))
+        #expect(doneOut.stdout.contains("DoneTitle"))
+
+        let errOut = await app.run(arguments: ["cal", "add", "--title", "Fail", "--start", "2026-11-20T11:00:00-03:00", "--plain"])
+        #expect(errOut.exitCode == .permissionOrPolicyDenied)
+        #expect(!errOut.stderr.contains("\u{001B}"))
+    }
+
+    @Test("Extreme duration strings return INVALID_DURATION without arithmetic trap")
+    func extremeDurationsDoNotOverflowTrap() throws {
+        for raw in ["106751991167301d", "99999999999999999999h", "4000d"] {
+            do {
+                _ = try DateParsing.parseDuration(raw)
+                Issue.record("Expected INVALID_DURATION for '\(raw)'")
+            } catch let err as DaykitError {
+                #expect(err.code == "INVALID_DURATION")
+                #expect(err.exitCode == .usageError)
+            }
+        }
     }
 }

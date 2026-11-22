@@ -113,7 +113,7 @@ public struct DaykitApp: Sendable {
                 )
                 let out = useJSON
                     ? try OutputFormatting.encodeSuccess(command: "cal add", data: result, now: now, timeZone: timeZone)
-                    : "Created\(result.dryRun ? " (dry-run)" : ""): \(title)\n"
+                    : "Created\(result.dryRun ? " (dry-run)" : ""): \(OutputFormatting.stripControlAndANSI(title))\n"
                 return ExecutionOutput(exitCode: .success, stdout: out, stderr: "")
 
             case .calUpdate(let id, let title, let startRaw, let endRaw, let durationRaw, let allDay, let calendarRef, let locationPatch, let notesPatch, let urlPatch, let alarmsPatch, let span, let dryRun, let yes):
@@ -197,7 +197,7 @@ public struct DaykitApp: Sendable {
                 )
                 let out = useJSON
                     ? try OutputFormatting.encodeSuccess(command: "rem add", data: result, now: now, timeZone: timeZone)
-                    : "Created reminder\(result.dryRun ? " (dry-run)" : ""): \(title)\n"
+                    : "Created reminder\(result.dryRun ? " (dry-run)" : ""): \(OutputFormatting.stripControlAndANSI(title))\n"
                 return ExecutionOutput(exitCode: .success, stdout: out, stderr: "")
 
             case .remUpdate(let id, let title, let listRef, let duePatch, let priority, let notesPatch, let urlPatch, let dryRun):
@@ -220,7 +220,7 @@ public struct DaykitApp: Sendable {
                 let result = try await runRemDone(id: id, dryRun: dryRun)
                 let out = useJSON
                     ? try OutputFormatting.encodeSuccess(command: "rem done", data: result, now: now, timeZone: timeZone)
-                    : "Completed reminder\(result.dryRun ? " (dry-run)" : ""): \(result.title) (id=\(result.completedId))\n"
+                    : "Completed reminder\(result.dryRun ? " (dry-run)" : ""): \(OutputFormatting.stripControlAndANSI(result.title)) (id=\(result.completedId))\n"
                 return ExecutionOutput(exitCode: .success, stdout: out, stderr: "")
 
             case .remDelete(let id, let dryRun, let yes):
@@ -245,13 +245,15 @@ public struct DaykitApp: Sendable {
                 return ExecutionOutput(exitCode: .success, stdout: out, stderr: "")
             }
         } catch let error as DaykitError {
+            let cleanMsg = OutputFormatting.stripControlAndANSI(error.message)
+            let cleanHint = error.hint.map { "\nhint: \(OutputFormatting.stripControlAndANSI($0))" } ?? ""
             let errOut = useJSON
                 ? OutputFormatting.encodeError(error)
-                : "error [\(error.code)]: \(error.message)\(error.hint.map { "\nhint: \($0)" } ?? "")\n"
+                : "error [\(error.code)]: \(cleanMsg)\(cleanHint)\n"
             return ExecutionOutput(exitCode: error.exitCode, stdout: "", stderr: errOut)
         } catch {
             let wrapped = DaykitError(code: "INTERNAL_ERROR", exitCode: .runtimeError, message: error.localizedDescription)
-            let errOut = useJSON ? OutputFormatting.encodeError(wrapped) : "error: \(wrapped.message)\n"
+            let errOut = useJSON ? OutputFormatting.encodeError(wrapped) : "error: \(OutputFormatting.stripControlAndANSI(wrapped.message))\n"
             return ExecutionOutput(exitCode: .runtimeError, stdout: "", stderr: errOut)
         }
     }
@@ -366,8 +368,15 @@ public struct DaykitApp: Sendable {
         }
     }
 
-    private func ensureAllowedByPolicy(targetId: String, title: String, sourceName: String, allowlist: [String], domainLabel: String) throws {
-        guard !allowlist.isEmpty else { return }
+    private func ensureAllowedByPolicy(targetId: String, title: String, sourceName: String, allowlist: [String], restricted: Bool, domainLabel: String) throws {
+        guard restricted else { return }
+        if allowlist.isEmpty {
+            throw DaykitError(
+                code: "POLICY_DENIED",
+                exitCode: .permissionOrPolicyDenied,
+                message: "Target \(domainLabel) '\(sourceName)/\(title)' is blocked because the writable \(domainLabel) allowlist is explicitly set to empty."
+            )
+        }
         let qualified = "\(sourceName)/\(title)".lowercased()
         let allowed = allowlist.contains { entry in
             let norm = entry.lowercased()
@@ -445,6 +454,7 @@ public struct DaykitApp: Sendable {
             title: cal.title,
             sourceName: cal.sourceName,
             allowlist: policy.writableCalendars,
+            restricted: policy.writableCalendarsRestricted,
             domainLabel: "calendar"
         )
         guard cal.writable else {
@@ -516,6 +526,7 @@ public struct DaykitApp: Sendable {
             title: list.title,
             sourceName: list.sourceName,
             allowlist: policy.writableLists,
+            restricted: policy.writableListsRestricted,
             domainLabel: "reminder list"
         )
         guard list.writable else {

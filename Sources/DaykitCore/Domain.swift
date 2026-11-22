@@ -1,7 +1,7 @@
 import Foundation
 
 public enum DaykitVersion {
-    public static let current = "0.2.0"
+    public static let current = "0.2.1"
     public static let schemaVersion = 1
 }
 
@@ -164,6 +164,8 @@ public struct RuntimePolicy: Sendable, Codable, Equatable {
     public let readOnly: Bool
     public let writableCalendars: [String]
     public let writableLists: [String]
+    public let writableCalendarsRestricted: Bool
+    public let writableListsRestricted: Bool
     public let auditLogEnabled: Bool
     public let auditLogPath: String?
 
@@ -171,6 +173,8 @@ public struct RuntimePolicy: Sendable, Codable, Equatable {
         case readOnly = "read_only"
         case writableCalendars = "writable_calendars"
         case writableLists = "writable_lists"
+        case writableCalendarsRestricted = "writable_calendars_restricted"
+        case writableListsRestricted = "writable_lists_restricted"
         case auditLogEnabled = "audit_log_enabled"
         case auditLogPath = "audit_log_path"
     }
@@ -179,12 +183,16 @@ public struct RuntimePolicy: Sendable, Codable, Equatable {
         readOnly: Bool = false,
         writableCalendars: [String] = [],
         writableLists: [String] = [],
+        writableCalendarsRestricted: Bool? = nil,
+        writableListsRestricted: Bool? = nil,
         auditLogEnabled: Bool = true,
         auditLogPath: String? = nil
     ) {
         self.readOnly = readOnly
         self.writableCalendars = writableCalendars
         self.writableLists = writableLists
+        self.writableCalendarsRestricted = writableCalendarsRestricted ?? !writableCalendars.isEmpty
+        self.writableListsRestricted = writableListsRestricted ?? !writableLists.isEmpty
         self.auditLogEnabled = auditLogEnabled
         self.auditLogPath = auditLogPath
     }
@@ -193,8 +201,10 @@ public struct RuntimePolicy: Sendable, Codable, Equatable {
         let truthy = Set(["1", "true", "yes", "on"])
         let rawReadOnly = environment["DAYKIT_READ_ONLY"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         let readOnly = truthy.contains(rawReadOnly)
-        let calendars = parseAllowlist(environment["DAYKIT_WRITABLE_CALENDARS"])
-        let lists = parseAllowlist(environment["DAYKIT_WRITABLE_LISTS"])
+        let rawCalendars = environment["DAYKIT_WRITABLE_CALENDARS"]
+        let rawLists = environment["DAYKIT_WRITABLE_LISTS"]
+        let calendars = parseAllowlist(rawCalendars)
+        let lists = parseAllowlist(rawLists)
 
         let rawDisableAudit = environment["DAYKIT_DISABLE_AUDIT_LOG"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         let auditEnabled = !truthy.contains(rawDisableAudit)
@@ -218,6 +228,8 @@ public struct RuntimePolicy: Sendable, Codable, Equatable {
             readOnly: readOnly,
             writableCalendars: calendars,
             writableLists: lists,
+            writableCalendarsRestricted: rawCalendars != nil,
+            writableListsRestricted: rawLists != nil,
             auditLogEnabled: auditEnabled,
             auditLogPath: resolvedAuditPath
         )

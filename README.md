@@ -33,7 +33,7 @@ To uninstall:
 ./install.sh --uninstall
 ```
 
-## Commands (`v0.2.0`)
+## Commands (`v0.2.1`)
 
 ```bash
 # Diagnostics (never prompts unless --request-access is passed; always exits 0)

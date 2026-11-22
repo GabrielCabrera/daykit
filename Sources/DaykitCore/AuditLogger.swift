@@ -67,11 +67,27 @@ public final class FileAuditLogWriter: AuditLogWriter, @unchecked Sendable {
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
-            if parentURL.lastPathComponent == "daykit" {
+            var parentStat = Darwin.stat()
+            guard Darwin.lstat(parentURL.path, &parentStat) == 0 else {
+                let errText = String(cString: strerror(errno))
+                throw DaykitError(
+                    code: "AUDIT_LOG_ERROR",
+                    exitCode: .runtimeError,
+                    message: "Cannot inspect audit log directory '\(parentURL.path)': \(errText)"
+                )
+            }
+            guard (parentStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else {
+                throw DaykitError(
+                    code: "AUDIT_LOG_ERROR",
+                    exitCode: .runtimeError,
+                    message: "Audit log parent '\(parentURL.path)' is not a regular directory."
+                )
+            }
+            if parentURL.lastPathComponent == "daykit" && parentStat.st_uid == Darwin.getuid() {
                 _ = Darwin.chmod(parentURL.path, 0o700)
             }
 
-            let fd = Darwin.open(path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
+            let fd = Darwin.open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_NONBLOCK, 0o600)
             guard fd >= 0 else {
                 let errText = String(cString: strerror(errno))
                 throw DaykitError(
@@ -81,6 +97,25 @@ public final class FileAuditLogWriter: AuditLogWriter, @unchecked Sendable {
                 )
             }
             defer { _ = Darwin.close(fd) }
+
+            var fileStat = Darwin.stat()
+            guard Darwin.fstat(fd, &fileStat) == 0 else {
+                let errText = String(cString: strerror(errno))
+                throw DaykitError(
+                    code: "AUDIT_LOG_ERROR",
+                    exitCode: .runtimeError,
+                    message: "Cannot inspect audit log '\(path)': \(errText)"
+                )
+            }
+            guard (fileStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+                  fileStat.st_uid == Darwin.getuid()
+            else {
+                throw DaykitError(
+                    code: "AUDIT_LOG_ERROR",
+                    exitCode: .runtimeError,
+                    message: "Audit log '\(path)' must be a regular file owned by the current user."
+                )
+            }
 
             if Darwin.fchmod(fd, 0o600) != 0 {
                 let errText = String(cString: strerror(errno))
